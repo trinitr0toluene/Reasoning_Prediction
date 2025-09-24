@@ -53,7 +53,7 @@ ROLE_PATTERNS = {
     "conclude": RE_CONCLUDE,
 }
 
-N = 20000
+N = 2000
 # ---------------- 数据结构 ----------------
 @dataclass
 class Sentence:
@@ -311,14 +311,18 @@ def _is_hard_boundary(a, b) -> bool:
     """
     永不跨越的边界：结论步、验算步、从引入/计划直接切到推导的首个等式。
     """
-    if getattr(a, "is_conclusion", False) or getattr(b, "is_conclusion", False):
-        return True
-    if getattr(a, "is_check", False) or getattr(b, "is_check", False):
-        return True
-    # 引入/计划 -> 推导 的转折（避免吞掉“开始推导”的第一步）
-    if (a.role in {"introduce", "plan"}) and (b.role in {"derive", "intermediate"}) and (b.has_equation):
-        return True
-    return False
+    txt_a = (a.text or "").lower()
+    txt_b = (b.text or "").lower()
+    strong_a = ("\\boxed" in a.text) or ("final answer" in txt_a) or ("answer is" in txt_a)
+    strong_b = ("\\boxed" in b.text) or ("final answer" in txt_b) or ("answer is" in txt_b)
+
+    # 仅尾部的验算才是硬边界
+    ra = getattr(a, "features", {}).get("rel_pos", 0.0)
+    rb = getattr(b, "features", {}).get("rel_pos", 0.0)
+    tail_check = (a.is_check and ra >= 0.6) or (b.is_check and rb >= 0.6)
+
+    plan2derive = (a.role in {"introduce","plan"}) and (b.role in {"derive","intermediate"}) and b.has_equation
+    return strong_a or strong_b or tail_check or plan2derive
 
 def _boundary_cost(a, b) -> float:
     """
@@ -396,16 +400,16 @@ def _pack_by_token_budget(macros, tok=None, max_tokens=120):
     return new
 
 def _normalize_conclusion(macros):
-    """把含 \\boxed 的步强制视为结论步；弱结论仅保留在尾部。"""
-    n = max(1, len(macros))
-    for i, m in enumerate(macros, 1):
-        if "\\boxed" in m.text:
+    for m in macros:
+        if "\\boxed" in (m.text or ""):
             m.is_conclusion = True
             m.role = "conclude"
         else:
-            # 弱结论：仅尾部 30% 且命中结论词才标记
-            if (i / n) >= 0.7 and RE_CONCLUDE.search(m.text or ""):
-                m.is_conclusion = True
+            # 弱结论只做特征，不改 is_conclusion
+            if RE_CONCLUDE.search(m.text or ""):
+                feats = getattr(m, "features", {}) or {}
+                feats["weak_conclude"] = 1
+                m.features = feats
     return macros
 
 def compress_macros(macros, tok=None, target_min=18, target_max=26):
@@ -449,7 +453,7 @@ def compress_macros(macros, tok=None, target_min=18, target_max=26):
 
     # 3) 保险丝：如果仍超标，用 token 预算顺序打包（尊重硬边界）
     if len(macros) > target_max:
-        macros = _pack_by_token_budget(macros, tok, max_tokens=120)
+        macros = _pack_by_token_budget(macros, tok, max_tokens=90)
 
     # 4) 最终重排 mid / rel_pos
     _relabel_relpos(macros)
