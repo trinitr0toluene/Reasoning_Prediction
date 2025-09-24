@@ -1,0 +1,25 @@
+#!/bin/bash
+#SBATCH --job-name=test_job          # 任务名
+#SBATCH --output=/home/zhang238/test_out.txt   # 标准输出文件
+#SBATCH --error=/home/zhang238/test_err.txt    # 错误输出文件
+#SBATCH --time=02:00:00              # 最长运行时间 (2min)
+#SBATCH --mem=50G                    # 内存
+#SBATCH --gres=gpu:1                 # 申请1块GPU
+
+# 打印 GPU 信息
+echo "=== nvidia-smi ==="
+nvidia-smi
+
+# 打印 CUDA 编译器版本 (可选)
+nvcc --version
+
+source activate
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate py311
+
+# 打印 Python & CUDA 可用性
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count());"
+
+
+# /home/zhang238/miniconda3/envs/py311/bin/python /home/zhang238/code/Reasoning_Prediction/ft_classify.py
+python /home/zhang238/code/Reasoning_Prediction/openr1_math_preprocess.py

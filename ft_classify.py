@@ -19,9 +19,11 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # ==== 设置路径 ====
 # DATA_FILE = "./datasets/openr1_reasoning_token_dataset.json"
-DATA_FILE = "/home/zhang238/code/Reasoning_Length_Prediction-main/openr1math_dataset.json"
+DATA_FILE = "/home/zhang238/code/Reasoning_Prediction/dataset/openr1Medical_dataset.json"
 BASE_MODEL = "Qwen/Qwen2.5-3B"
 OUTPUT_DIR = "./qwen3b-lora-90000-classification-epoch5"
+
+print("CUDA available:", torch.cuda.is_available())
 
 # ==== 构建分类桶 ====
 def bin_token_count(value):
