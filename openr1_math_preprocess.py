@@ -11,13 +11,14 @@ from transformers import AutoTokenizer
 from itertools import islice
 from tqdm import tqdm  # 进度条
 
+
 # ---------------- CLI ----------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="default", choices=["default","extended","all"])
     ap.add_argument("--tokenizer", default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--topk", type=int, default=0, help="为宏步骤预筛的个数（0=不筛）")
-    ap.add_argument("--outdir", type=str, default="out")
+    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out200k")
     ap.add_argument("--limit", type=int, default=0, help="仅处理前N条（调试）")
     return ap.parse_args()
 
@@ -53,7 +54,7 @@ ROLE_PATTERNS = {
     "conclude": RE_CONCLUDE,
 }
 
-N = 2000
+N = 200000
 # ---------------- 数据结构 ----------------
 @dataclass
 class Sentence:
