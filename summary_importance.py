@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 import argparse
 import json
 import os
@@ -6,29 +6,14 @@ import re
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Iterable, Optional
-from transformers import AutoTokenizer
 import numpy as np
 import math
 from collections import defaultdict
 from tqdm import tqdm
 
-# --- vLLM imports ---
-try:
-    from vllm import LLM, SamplingParams
-except Exception as e:
-    print("ERROR: vLLM is required to run this script. Please install vllm.", file=sys.stderr)
-    raise
-
-# try:
-#     from transformers import AutoTokenizer
-# except Exception as e:
-#     print("ERROR: transformers is required to run this script. Please install transformers.", file=sys.stderr)
-#     raise
-
 # --------------------
 # Utility: JSONL IO
 # --------------------
-
 def read_jsonl(path: str) -> List[dict]:
     items = []
     with open(path, 'r', encoding='utf-8') as f:
@@ -46,7 +31,6 @@ def write_jsonl(path: str, records: Iterable[dict]):
 # --------------------
 # Data structures
 # --------------------
-
 @dataclass(frozen=True)
 class Key:
     uuid: str
@@ -60,26 +44,28 @@ class Sample:
     steps: List[str]         # steps according to chosen granularity
     full_trace: str          # concatenation of steps
 
+@dataclass
+class GenTask:
+    sample_key: Key
+    variant: str       # "base" or f"drop_{k}"
+    step_index: int    # -1 for base; otherwise dropped step index
+    prompt_text: str
+
 # --------------------
 # Answer extraction & normalization
 # --------------------
-
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
 ANS_TAG_RE = re.compile(r"(?:Final Answer|Answer)\s*[:：]\s*(.+)", re.IGNORECASE)
 
 def extract_final_answer(text: str) -> str:
     if not text:
         return ""
-    # 1) \boxed{...}
     m = BOXED_RE.search(text)
     if m:
         return m.group(1).strip()
-    # 2) "Final Answer: ..."
     m = ANS_TAG_RE.search(text)
     if m:
-        # stop at first line break
         return m.group(1).strip().splitlines()[0].strip()
-    # 3) Otherwise, take the last non-empty line
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     if lines:
         return lines[-1]
@@ -88,7 +74,7 @@ def extract_final_answer(text: str) -> str:
 LATEX_CLEAN_RE = re.compile(
     r"(\\mathrm\{[^}]*\}|\\text\{[^}]*\}|\\left|\\right|\\!|\\,|\\;|\\:|\\quad|\\qquad|\\hspace\{[^}]*\}|\\phantom\{[^}]*\})"
 )
-MATH_MARK_RE = re.compile(r"[\$\u200b]")  # remove $ and zero-width chars
+MATH_MARK_RE = re.compile(r"[\$\u200b]")
 WS_RE = re.compile(r"\s+")
 
 def normalize_answer(s: str) -> str:
@@ -97,16 +83,14 @@ def normalize_answer(s: str) -> str:
     s = s.strip()
     s = LATEX_CLEAN_RE.sub("", s)
     s = MATH_MARK_RE.sub("", s)
-    # Remove enclosing parentheses if they wrap entire string
     if s.startswith("(") and s.endswith(")"):
         s = s[1:-1].strip()
     s = WS_RE.sub("", s)
     return s
 
 # --------------------
-# Prompt builder
+# Prompt builder (Qwen chat)
 # --------------------
-
 SYSTEM_PROMPT = (
     "You are a precise math solver. Use the provided hints to compute the answer. "
     "Do NOT show steps. Respond with only the final answer, ideally in LaTeX like \\boxed{...}."
@@ -128,26 +112,80 @@ def build_chat_prompt(tokenizer, problem: str, hints: str) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": USER_TEMPLATE.format(problem=problem, hints=hints)},
     ]
-    # Apply the chat template for the target model
     return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+
+# --------------------
+# Sentence / step segmentation from summary
+# --------------------
+import regex as re2
+RE_LATEX_BLOCK = re2.compile(r"(\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\))", flags=re2.S)
+RE_BULLET = re2.compile(r"^\s*(?:\d+[\.\)]|[-*•])\s+")
+RE_SENT_END = re2.compile(r"([\.!?])(\s+|$)")
+RE_META = re2.compile(r"^\s*(ok(ay)?|hmm+|let me|now|wait|note that|remember|i need to|i should|maybe|well|alright)\b", re2.I)
+
+def _normalize_text(s: str) -> str:
+    s = s.replace("\r","\n")
+    s = re2.sub(r"[ \t]+"," ", s)
+    s = re2.sub(r"\n{3,}","\n\n", s)
+    return s.strip()
+
+def _hold_latex(s: str) -> Tuple[str,List[str]]:
+    blocks=[]
+    def repl(m):
+        blocks.append(m.group(0))
+        return f"⟦LATEX_{len(blocks)-1}⟧"
+    return RE_LATEX_BLOCK.sub(repl, s), blocks
+
+def _restore_latex(s: str, blocks: List[str]) -> str:
+    for i,b in enumerate(blocks):
+        s = s.replace(f"⟦LATEX_{i}⟧", b)
+    return s
+
+def split_sentences_from_text(text: str) -> List[str]:
+    """保护 LaTeX，按行号/句末符分句，并把极短口癖句并到后句。"""
+    text = _normalize_text(text or "")
+    text_hold, blocks = _hold_latex(text)
+
+    rough=[]
+    for line in text_hold.split("\n"):
+        line=line.strip()
+        if not line: continue
+        if RE_BULLET.match(line):
+            rough.append(RE_BULLET.sub("", line)); continue
+        start=0
+        for m in RE_SENT_END.finditer(line):
+            end=m.end(1)
+            rough.append(line[start:end].strip())
+            start=m.end()
+        tail=line[start:].strip()
+        if tail: rough.append(tail)
+
+    rough=[_restore_latex(s, blocks) for s in rough]
+
+    merged=[]; i=0
+    while i<len(rough):
+        seg=rough[i].strip()
+        if not seg: i+=1; continue
+        if (len(seg)<=6 or RE_META.match(seg)) and i+1 < len(rough):
+            merged.append((seg + " " + rough[i+1]).strip()); i += 2
+        else:
+            merged.append(seg); i += 1
+    return merged
 
 # --------------------
 # Data loading & alignment
 # --------------------
-
-def align_samples(
+def align_from_preprocessed(
     raw_masked_path: str,
     macro_steps_path: str,
     sentences_path: str,
     granularity: str = "macro",
 ) -> List[Sample]:
     raw = read_jsonl(raw_masked_path)
-    # Index raw by key
     raw_by_key: Dict[Key, dict] = {}
     for r in raw:
         raw_by_key[Key(uuid=r["uuid"], gen_index=int(r["gen_index"]))] = r
 
-    # Choose segmentation source
     if granularity == "macro":
         seg = read_jsonl(macro_steps_path)
         get_steps = lambda obj: [ms["text"] for ms in obj["macro_steps"]]
@@ -161,7 +199,6 @@ def align_samples(
     for s in seg:
         key = Key(uuid=s["uuid"], gen_index=int(s["gen_index"]))
         if key not in raw_by_key:
-            # Skip if the segmentation and raw don't align
             continue
         r = raw_by_key[key]
         steps = get_steps(s)
@@ -169,28 +206,62 @@ def align_samples(
         samples.append(
             Sample(
                 key=key,
-                problem=r["problem"],
-                gold_answer=r.get("answer_gold", ""),
+                problem=r.get("problem",""),
+                gold_answer=r.get("answer_gold","") or r.get("answer",""),
                 steps=steps,
                 full_trace=full_trace,
             )
         )
     return samples
 
+def align_from_summary_jsonl(
+    summary_jsonl: str,
+    granularity: str = "sentence",
+    source_priority: Tuple[str,...] = ("summary_answer_driven","traces_natural"),
+) -> List[Sample]:
+    """直接从 /mnt/data/out_openr1_answer_summaries.jsonl 构造样本。"""
+    data = read_jsonl(summary_jsonl)
+    samples: List[Sample] = []
+    for i, ex in enumerate(data):
+        uuid = ex.get("uuid") or ex.get("id") or f"rec_{i:06d}"
+        problem = ex.get("question","")
+        gold_answer = ex.get("final_answer","") or ex.get("answer","") or ""
+        text_src = None
+
+        for key in source_priority:
+            val = ex.get(key)
+            if isinstance(val, str) and val.strip():
+                text_src = val.strip()
+                break
+            if isinstance(val, list) and val:
+                text_src = "\n".join([str(v) for v in val if str(v).strip()])
+                break
+
+        if not text_src:
+            # 没有 summary 也没有 traces，就跳过
+            continue
+
+        if granularity == "sentence":
+            steps = split_sentences_from_text(text_src)
+        elif granularity == "macro":
+            # 简约做法：仍按句子切，但后续你可以替换为更强的 chunker
+            steps = split_sentences_from_text(text_src)
+        else:
+            raise ValueError(f"Unknown granularity: {granularity}")
+
+        full_trace = "\n".join(steps)
+        samples.append(Sample(
+            key=Key(uuid=uuid, gen_index=0),  # summary 默认只有一条轨迹
+            problem=problem,
+            gold_answer=gold_answer,
+            steps=steps,
+            full_trace=full_trace,
+        ))
+    return samples
+
 # --------------------
-# Inference runner
+# Batching helper
 # --------------------
-
-from dataclasses import dataclass
-
-@dataclass
-class GenTask:
-    # One forward pass request
-    sample_key: Key
-    variant: str       # "base" or f"drop_{k}"
-    step_index: int    # -1 for base; otherwise dropped step index
-    prompt_text: str
-
 def batched(iterable: Iterable, n: int) -> Iterable[List]:
     batch = []
     for x in iterable:
@@ -201,120 +272,119 @@ def batched(iterable: Iterable, n: int) -> Iterable[List]:
     if batch:
         yield batch
 
+# --------------------
+# Core: run ablation
+# --------------------
 def run_ablation(
     model_name: str,
     granularity: str,
-    raw_masked_path: str,
-    macro_steps_path: str,
-    sentences_path: str,
     out_path: str,
+    # —— data sources ——
+    summary_jsonl: Optional[str] = None,
+    raw_masked_path: Optional[str] = None,
+    macro_steps_path: Optional[str] = None,
+    sentences_path: Optional[str] = None,
+    # —— gen params ——
     max_new_tokens: int = 32,
     bsz: int = 32,
     limit: Optional[int] = None,
     dtype: str = "float16",
     gpu_mem_util: float = 0.75,
-    max_model_len: int = 8192,
+    max_model_len: int = 16384,
     download_dir: Optional[str] = None,
-    offline: bool = False,
-    ctx_headroom: int = 64,   # [MOD] 可配置模板余量（默认 64）
-    importance: str = "logp",
+    offline: bool = True,
+    ctx_headroom: int = 64,
+    importance: str = "logp",              # or "acc_drop"
     normalize: str = "minmax",
+    stop: Optional[List[str]] = None,
+    tp: int = 1,
 ):
-    # --- Set env for offline & MKL threading (before importing heavy libs) ---
+    # --- env for offline & threads ---
     if offline:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    # Make MKL use GNU OpenMP (avoid libgomp conflict)
     os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-    # Lazy imports after env setup
     from transformers import AutoTokenizer
-    try:
-        from vllm import LLM, SamplingParams
-    except Exception as e:
-        print("ERROR: vLLM is required to run this script. Please install vllm.", file=sys.stderr)
-        raise
+    from vllm import LLM, SamplingParams
 
-    # Choose a default download/cache dir if not provided
     if download_dir is None:
         download_dir = os.getenv("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+
+    local_only = offline or os.path.isdir(model_name)
 
     print(f"Loading tokenizer for {model_name} ...", file=sys.stderr)
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
         use_fast=True,
-        local_files_only=offline,   # <- critical for offline
+        local_files_only=local_only,
     )
 
     print(f"Loading model {model_name} (dtype={dtype}) with vLLM ...", file=sys.stderr)
     llm = LLM(
-        model=model_name,                 # strongly recommend a *local directory* when offline
+        model=model_name,
         dtype=dtype,
         trust_remote_code=True,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tp,
         gpu_memory_utilization=gpu_mem_util,
         max_model_len=max_model_len,
-        download_dir=download_dir,        # vLLM will only look here when offline
-        # You can also set enforce_eager=True if you prefer eager (sometimes more RAM friendly)
-        # enforce_eager=False,
+        download_dir=download_dir,
     )
 
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         max_tokens=max_new_tokens,
-        stop=[],
-        logprobs=1, 
+        stop=stop or [],
+        logprobs=1,
     )
 
-    print("Aligning samples ...", file=sys.stderr)
-    samples = align_samples(
-        raw_masked_path=raw_masked_path,
-        macro_steps_path=macro_steps_path,
-        sentences_path=sentences_path,
-        granularity=granularity,
-    )
+    # ---------- build samples ----------
+    if summary_jsonl:
+        print(f"[data] Using summary JSONL: {summary_jsonl}", file=sys.stderr)
+        samples = align_from_summary_jsonl(summary_jsonl, granularity=granularity)
+    else:
+        print(f"[data] Using preprocessed files", file=sys.stderr)
+        if not (raw_masked_path and macro_steps_path and sentences_path):
+            raise ValueError("When summary_jsonl is not provided, raw/macro/sentences paths are required.")
+        samples = align_from_preprocessed(
+            raw_masked_path=raw_masked_path,
+            macro_steps_path=macro_steps_path,
+            sentences_path=sentences_path,
+            granularity=granularity,
+        )
+
     if limit is not None:
         samples = samples[:limit]
     print(f"Total aligned samples: {len(samples)}", file=sys.stderr)
 
-    # ======================= [MOD] 头尾截断: 工具函数 =======================
-    vtok = llm.get_tokenizer()  # 使用 vLLM 自己的 tokenizer，避免计数不一致
+    # ---------- helper: token counting & truncation ----------
+    vtok = llm.get_tokenizer()
 
     def prompt_len(text: str) -> int:
         return len(vtok.encode(text))
 
     def fit_head_tail(problem: str, steps: List[str], keep_idx: int, budget: int, sep: str = "\n"):
-        """
-        [MOD] 给定步骤列表，在不超过 token 预算的前提下，尽量取“头 + 尾”并在中间放 <...>。
-        - keep_idx = -1 表示 base（不删除任何步），否则表示 drop_k 时的“保留所有除 k 外的步骤”。
-        - 返回: (hints_text, head_count, tail_count, final_tokens)
-        """
-        # 1) 选择参与拼接的 steps
         if keep_idx == -1:
             other = steps
         else:
             other = steps[:keep_idx] + steps[keep_idx+1:]
 
-        # 2) 如果连空 hints 都放不下，则返回空字符串（上游再决定跳过）
         empty_prompt = build_chat_prompt(tokenizer, problem, "")
         if prompt_len(empty_prompt) > budget:
             return "", 0, 0, prompt_len(empty_prompt)
 
-        # 3) 双端贪心：优先塞头部，再塞尾部，直到无法继续
         head, tail = [], []
         i, j = 0, len(other) - 1
 
-        # helper to构建提示并计数
         def build_with(head_ls, tail_ls) -> Tuple[str, int]:
             hints = sep.join(head_ls + (["<...>"] if head_ls or tail_ls else []) + tail_ls)
             pr = build_chat_prompt(tokenizer, problem, hints)
             return hints, prompt_len(pr)
 
-        # 先尽可能塞头（直观、简单；避免来回震荡）
         while i <= j:
             cand_head = head + [other[i]]
             hints, toks = build_with(cand_head, tail)
@@ -323,7 +393,7 @@ def run_ablation(
                 i += 1
             else:
                 break
-        # 再尽可能塞尾
+
         while i <= j:
             cand_tail = [other[j]] + tail
             hints, toks = build_with(head, cand_tail)
@@ -333,12 +403,9 @@ def run_ablation(
             else:
                 break
 
-        # 最终构建
         hints, toks = build_with(head, tail)
         return hints, len(head), len(tail), toks
-    # ======================= [MOD END 工具函数] =======================
 
-    # [MOD] 预算：为生成和模板留出余量
     CTX_BUDGET = max_model_len - max_new_tokens - ctx_headroom
     if CTX_BUDGET <= 0:
         raise ValueError(
@@ -347,22 +414,22 @@ def run_ablation(
         )
     print(f"[truncate] context budget={CTX_BUDGET}, headroom={ctx_headroom}", file=sys.stderr)
 
-    # [MOD] 记录被截断/无法容纳的样本
     trunc_logs: List[dict] = []
     impossible_logs: List[dict] = []
 
-    # Build generation tasks  [MOD]：在构建时就做长度检查与截断
-
-    # Build generation tasks
+    # ---------- build generation tasks (with truncation) ----------
     tasks: List[GenTask] = []
+    gold_by_key = {}
+
     for s in samples:
-        # Base (full trace)
+        # golds for acc_drop
+        gold_by_key[s.key] = s.gold_answer
+
         base_prompt = build_chat_prompt(tokenizer, s.problem, s.full_trace)
         base_len = prompt_len(base_prompt)
         base_hints = s.full_trace
         truncated_variants = []
 
-        # 如果连空 hints 的 base 都放不下，记录为 impossible 并跳过该样本
         empty_len = prompt_len(build_chat_prompt(tokenizer, s.problem, ""))
         if empty_len > CTX_BUDGET or empty_len > max_model_len:
             impossible_logs.append({
@@ -385,7 +452,6 @@ def run_ablation(
 
         tasks.append(GenTask(sample_key=s.key, variant="base", step_index=-1, prompt_text=base_prompt))
 
-        # Per-step ablations
         for k in range(len(s.steps)):
             hints_k = "\n".join(s.steps[:k] + s.steps[k+1:])
             prompt_k = build_chat_prompt(tokenizer, s.problem, hints_k)
@@ -403,7 +469,6 @@ def run_ablation(
 
             tasks.append(GenTask(sample_key=s.key, variant=f"drop_{k}", step_index=k, prompt_text=prompt_k))
 
-        # 若该样本有任何变体被截断，记录日志
         if truncated_variants:
             trunc_logs.append({
                 "uuid": s.key.uuid,
@@ -416,47 +481,31 @@ def run_ablation(
                 "truncated_variants": truncated_variants,
             })
 
-    # [MOD] 写出截断/不可容纳日志
     if trunc_logs:
         trunc_path = os.path.splitext(out_path)[0] + ".truncated.jsonl"
-        with open(trunc_path, "w", encoding="utf-8") as f:
-            for rec in trunc_logs:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        write_jsonl(trunc_path, trunc_logs)
         print(f"[truncate] Wrote {len(trunc_logs)} truncated-sample records -> {trunc_path}", file=sys.stderr)
 
     if impossible_logs:
         imp_path = os.path.splitext(out_path)[0] + ".impossible.jsonl"
-        with open(imp_path, "w", encoding="utf-8") as f:
-            for rec in impossible_logs:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        write_jsonl(imp_path, impossible_logs)
         print(f"[truncate] Wrote {len(impossible_logs)} impossible-sample records -> {imp_path}", file=sys.stderr)
 
     print(f"Total generation tasks (after truncation): {len(tasks)}", file=sys.stderr)
 
-    #         drop_prompt = build_chat_prompt(tokenizer, s.problem, hints)
-    #         tasks.append(GenTask(sample_key=s.key, variant=f"drop_{k}", step_index=k, prompt_text=drop_prompt))
-
-    # print(f"Total generation tasks (base + ablations): {len(tasks)}", file=sys.stderr)
-
-    # # Precompute gold lookup
-    # gold_by_key = {s.key: s.gold_answer for s in samples}
-
-    # # Run in batches
-
+    # ---------- run generation ----------
     results = []
+    from vllm import LLM  # ensure namespace exists
     for i in tqdm(range(0, len(tasks), bsz), desc="Generating responses"):
         batch = tasks[i:i+bsz]
         outputs = llm.generate([t.prompt_text for t in batch], sampling_params=sampling_params, use_tqdm=False)
         for t, out in zip(batch, outputs):
-            # vLLM returns a RequestOutput with .outputs (list of candidates)
             cand = out.outputs[0] if out.outputs else None
             text = cand.text if cand else ""
 
-
-            # >>> ADD: robust chosen-token logprob extraction + avg log-p
+            # robust avg logp
             token_lps = getattr(cand, "token_logprobs", None) if cand else None
             if token_lps is None and cand is not None:
-                # fallback for older/newer vLLM shapes
                 lp_list = getattr(cand, "logprobs", None)
                 tok_ids = getattr(cand, "token_ids", None) or getattr(cand, "output_token_ids", None)
                 token_lps = []
@@ -476,26 +525,26 @@ def run_ablation(
             vals = [x for x in (token_lps or []) if x is not None and math.isfinite(x)]
             avg_logp = float(np.mean(vals)) if vals else float("nan")
             n_tok = len(vals)
-            # <<< ADD end
-    
+
             pred_raw = extract_final_answer(text)
             pred_norm = normalize_answer(pred_raw)
 
-            # # gold
-            # gold_raw = gold_by_key.get(t.sample_key, "")
-            # gold_norm = normalize_answer(gold_raw)
+            gold_raw = gold_by_key.get(t.sample_key, "")
+            gold_norm = normalize_answer(gold_raw)
+
+            is_match = int(pred_norm == gold_norm) if gold_norm else None
 
             record = {
                 "uuid": t.sample_key.uuid,
                 "gen_index": t.sample_key.gen_index,
-                "variant": t.variant,           # "base" or "drop_k"
-                "step_index": t.step_index,     # -1 for base
+                "variant": t.variant,
+                "step_index": t.step_index,
                 "pred_text": text,
                 "pred_extracted": pred_raw,
                 "pred_norm": pred_norm,
-                # "gold_raw": gold_raw,
-                # "gold_norm": gold_norm,
-                # "is_match": int(pred_norm == gold_norm) if gold_norm else None,
+                "gold_raw": gold_raw,
+                "gold_norm": gold_norm,
+                "is_match": is_match,
                 "granularity": granularity,
                 "model": str(model_name),
                 "max_new_tokens": max_new_tokens,
@@ -504,10 +553,11 @@ def run_ablation(
                 "offline": int(offline),
                 "ctx_headroom": ctx_headroom,
                 "avg_logp": avg_logp,
-                "gen_n_tokens": n_tok  
+                "gen_n_tokens": n_tok
             }
             results.append(record)
 
+    # ---------- importance aggregation ----------
     def _normalize_array(arr, method: str):
         x = np.array(arr, dtype=float)
         if method == "none":
@@ -528,120 +578,104 @@ def run_ablation(
             return [float((v - mu) / sd) if math.isfinite(v) else 0.0 for v in x]
         raise ValueError(f"Unknown normalize method: {method}")
 
-    # 1) 按 (uuid, gen_index) 分组
-    by_sid = defaultdict(lambda: {"base": None, "abl": {}})
+    # group by (uuid, gen_index)
+    by_sid = defaultdict(lambda: {"base_lp": None, "abl_lp": {}, "base_acc": None, "abl_acc": {}})
     for r in results:
         sid = f"{r['uuid']}|{r['gen_index']}"
         if r["step_index"] == -1:
-            by_sid[sid]["base"] = r.get("avg_logp", float("nan"))
+            by_sid[sid]["base_lp"] = r.get("avg_logp", float("nan"))
+            by_sid[sid]["base_acc"] = r.get("is_match", None)
         else:
-            by_sid[sid]["abl"][r["step_index"]] = r.get("avg_logp", float("nan"))
+            by_sid[sid]["abl_lp"][r["step_index"]] = r.get("avg_logp", float("nan"))
+            by_sid[sid]["abl_acc"][r["step_index"]] = r.get("is_match", None)
 
-    # 2) 计算 raw_delta 和 importance
+    # compute importance sequences
     imp_by_sid = {}
     for sid, pack in by_sid.items():
-        base = pack["base"]
-        if not isinstance(base, (int, float)) or not math.isfinite(base):
-            continue
-        # 使 ablation 序列按 step 索引 0..K-1 排好
-        K = (max(pack["abl"].keys()) + 1) if pack["abl"] else 0
-        lp_seq = [pack["abl"].get(i, float("nan")) for i in range(K)]
-        raw = [max(0.0, base - v) if (isinstance(v, (int, float)) and math.isfinite(v)) else 0.0
-            for v in lp_seq]
-        imp = _normalize_array(raw, method=normalize)   # <- 用函数参数 normalize
-        imp_by_sid[sid] = {"raw": raw, "imp": imp, "base": base}
+        base_lp = pack["base_lp"]
+        K = (max(pack["abl_lp"].keys()) + 1) if pack["abl_lp"] else 0
+        lp_seq = [pack["abl_lp"].get(i, float("nan")) for i in range(K)]
 
-    # 3) 回填到每条记录
+        raw_lp = []
+        if isinstance(base_lp, (int, float)) and math.isfinite(base_lp):
+            raw_lp = [max(0.0, base_lp - v) if (isinstance(v, (int, float)) and math.isfinite(v)) else 0.0
+                      for v in lp_seq]
+        imp_lp = _normalize_array(raw_lp, method=normalize) if raw_lp else []
+
+        base_acc = pack["base_acc"]
+        acc_seq = [pack["abl_acc"].get(i, None) for i in range(K)]
+        raw_acc = []
+        if base_acc is not None:
+            raw_acc = [max(0, int(base_acc) - int(v)) if (v is not None) else 0 for v in acc_seq]  # 1->0 = drop
+        # 0/1 本身即可作为重要性，不再归一
+        imp_acc = raw_acc
+
+        imp_by_sid[sid] = {"raw_lp": raw_lp, "imp_lp": imp_lp, "base_lp": base_lp,
+                           "raw_acc": raw_acc, "imp_acc": imp_acc, "base_acc": base_acc}
+
+    # fill back
     for r in results:
         sid = f"{r['uuid']}|{r['gen_index']}"
         pack = imp_by_sid.get(sid)
         if not pack:
             continue
         if r["step_index"] == -1:
-            r["baseline_avg_logp"] = pack["base"]
+            r["baseline_avg_logp"] = pack["base_lp"]
+            r["baseline_is_match"] = pack["base_acc"]
         else:
             k = r["step_index"]
-            if k < len(pack["imp"]):
-                r["logp_raw_delta"] = pack["raw"][k]
-                r["logp_importance"] = pack["imp"][k]
+            if k < len(pack["imp_lp"]):
+                r["logp_raw_delta"] = pack["raw_lp"][k]
+                r["logp_importance"] = pack["imp_lp"][k]
+            if k < len(pack["imp_acc"]):
+                r["acc_raw_delta"] = pack["raw_acc"][k]
+                r["acc_importance"] = pack["imp_acc"][k]
 
-    # 1) 按 (uuid, gen_index) 分组
-    by_sid = defaultdict(lambda: {"base": None, "abl": {}})
-    for r in results:
-        sid = f"{r['uuid']}|{r['gen_index']}"
-        if r["step_index"] == -1:
-            by_sid[sid]["base"] = r.get("avg_logp", float("nan"))
-        else:
-            by_sid[sid]["abl"][r["step_index"]] = r.get("avg_logp", float("nan"))
-
-    # 2) 计算 raw_delta 和 importance
-    imp_by_sid = {}
-    for sid, pack in by_sid.items():
-        base = pack["base"]
-        if not isinstance(base, (int, float)) or not math.isfinite(base):
-            continue
-        # 使 ablation 序列按 step 索引 0..K-1 排好
-        K = (max(pack["abl"].keys()) + 1) if pack["abl"] else 0
-        lp_seq = [pack["abl"].get(i, float("nan")) for i in range(K)]
-        raw = [max(0.0, base - v) if (isinstance(v, (int, float)) and math.isfinite(v)) else 0.0
-            for v in lp_seq]
-        imp = _normalize_array(raw, method=normalize)   # <- 用函数参数 normalize
-        imp_by_sid[sid] = {"raw": raw, "imp": imp, "base": base}
-
-    # 3) 回填到每条记录
-    for r in results:
-        sid = f"{r['uuid']}|{r['gen_index']}"
-        pack = imp_by_sid.get(sid)
-        if not pack:
-            continue
-        if r["step_index"] == -1:
-            r["baseline_avg_logp"] = pack["base"]
-        else:
-            k = r["step_index"]
-            if k < len(pack["imp"]):
-                r["logp_raw_delta"] = pack["raw"][k]
-                r["logp_importance"] = pack["imp"][k]
-    # === [END ADD] ===
-
-    # Write outputs
     write_jsonl(out_path, results)
     print(f"Wrote {len(results)} records to {out_path}", file=sys.stderr)
 
-
+# --------------------
+# CLI
+# --------------------
 def main():
     parser = argparse.ArgumentParser()
+    # model
     parser.add_argument("--model", type=str, default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct",
-                        help="Prefer a *local directory* when --offline is set.")
-    parser.add_argument("--granularity", type=str, choices=["macro", "sentence"], default="macro")
-    parser.add_argument("--raw-masked", type=str, default="/root/autodl-fs/out2000/raw_masked.jsonl")
-    parser.add_argument("--macro-steps", type=str, default="/root/autodl-fs/out2000/macro_steps.jsonl")
-    parser.add_argument("--sentences", type=str, default="/root/autodl-fs/out2000/sentences.jsonl")
-    parser.add_argument("--out", type=str, default="/root/autodl-tmp/out2000/math/reasoning/ablation_results.jsonl")
+                        help="Prefer a local directory for offline runs.")
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "auto"])
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--offline", action="store_true", default=True)
+
+    # data (two modes; summary first)
+    parser.add_argument("--summary-jsonl", type=str, default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
+                        help="If provided, the script reads from this file and segments steps on the fly.")
+    parser.add_argument("--raw-masked", type=str, default="/root/autodl-tmp/out200/summary/raw_masked.jsonl")
+    parser.add_argument("--macro-steps", type=str, default="/root/autodl-tmp/out200/summary/macro_steps.jsonl")
+    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out200/summary/sentences.jsonl")
+
+    # behavior
+    parser.add_argument("--granularity", type=str, choices=["macro", "sentence"], default="sentence")
+    parser.add_argument("--out", type=str, default="/root/autodl-fs/out200/summary/math/ablation_from_summary.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--bsz", type=int, default=32)
     parser.add_argument("--limit", type=int, default=2000)
-    parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "auto"])
     parser.add_argument("--gpu-mem-util", type=float, default=0.75)
     parser.add_argument("--max-model-len", type=int, default=16384)
-    parser.add_argument("--download-dir", type=str, default=None,
-                        help="Local cache dir for weights/tokenizer. Defaults to $HF_HOME or ~/.cache/huggingface")
-    parser.add_argument("--offline", action="store_true",
-                        help="Force offline mode (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE, and local_files_only for tokenizer).")
-    parser.add_argument("--ctx-headroom", type=int, default=64, help="[MOD] 头尾截断时为模板预留的 token 余量")
+    parser.add_argument("--download-dir", type=str, default=None)
+    parser.add_argument("--ctx-headroom", type=int, default=64)
     parser.add_argument("--importance", type=str, default="logp", choices=["logp", "acc_drop"])
     parser.add_argument("--normalize", type=str, default="minmax", choices=["minmax", "softmax", "zscore", "none"])
-    parser.add_argument("--tp", type=int, default=1)
-    # 可选：停止词
     parser.add_argument("--stop", type=str, nargs="*", default=None)
     args = parser.parse_args()
 
     run_ablation(
         model_name=args.model,
         granularity=args.granularity,
+        out_path=args.out,
+        summary_jsonl=args.summary_jsonl if args.summary_jsonl else None,
         raw_masked_path=args.raw_masked,
         macro_steps_path=args.macro_steps,
         sentences_path=args.sentences,
-        out_path=args.out,
         max_new_tokens=args.max_new_tokens,
         bsz=args.bsz,
         limit=args.limit,
@@ -653,6 +687,8 @@ def main():
         ctx_headroom=args.ctx_headroom,
         importance=args.importance,
         normalize=args.normalize,
+        stop=args.stop,
+        tp=args.tp,
     )
 
 if __name__ == "__main__":

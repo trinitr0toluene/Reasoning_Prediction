@@ -5,23 +5,29 @@ from typing import List, Dict, Any, Tuple, Optional
 from math import inf
 
 import regex
-from unidecode import unidecode
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from itertools import islice
 from tqdm import tqdm  # 进度条
 
-
 # ---------------- CLI ----------------
 def parse_args():
     ap = argparse.ArgumentParser()
+    # 若不使用本地JSONL，可继续用原HF数据集
     ap.add_argument("--split", default="default", choices=["default","extended","all"])
-    ap.add_argument("--tokenizer", default="Qwen/Qwen2.5-3B-Instruct")
+    ap.add_argument("--tokenizer", default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct")
     ap.add_argument("--topk", type=int, default=0, help="为宏步骤预筛的个数（0=不筛）")
     ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/summary")
-    ap.add_argument("--limit", type=int, default=0, help="仅处理前N条（调试）")
-    ap.add_argument("--input_jsonl", type=str, default="",
-                    help="若提供，则从该 JSONL 读取样本（支持字段 summary / answer_summaries）")
+    ap.add_argument("--limit", type=int, default=2000, help="仅处理前N条（调试）")
+
+    # 新增：本地 JSONL（已与你的文件对齐）
+    ap.add_argument("--input_jsonl", type=str,
+                    default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
+                    help="从该 JSONL 读取样本（支持 summary_answer_driven / traces_natural）")
+
+    # 新增：summary 较短，适当收紧目标步数
+    ap.add_argument("--target_min", type=int, default=8)
+    ap.add_argument("--target_max", type=int, default=16)
     return ap.parse_args()
 
 # ---------------- 正则/模式 ----------------
@@ -30,12 +36,10 @@ RE_LATEX_BLOCK = regex.compile(r"(\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\))", flags=r
 RE_BULLET = regex.compile(r"^\s*(?:\d+[\.\)]|[-*•])\s+")
 RE_SENT_END = regex.compile(r"([\.!?])(\s+|$)")
 RE_EQUATION = regex.compile(r"(=|\\Rightarrow|≥|≤|!=|\\approx|\\sim|\\frac|\\cdot|\\times|\\div)")
-# RE_CONCLUDE = regex.compile(r"\b(therefore|thus|hence|so|consequently|final answer|answer is|boxed)\b", regex.I)
 RE_CONCLUDE = re.compile(
     r"\b(therefore|thus|hence|consequently|in conclusion|final answer|answer is)\b",
     re.I
 )
-
 RE_VERIFY = regex.compile(r"\b(verify|check|plug\s+in|substitute\s+back|substitution)\b", regex.I)
 RE_META = regex.compile(r"^\s*(ok(ay)?|hmm+|let me|now|wait|note that|remember|i need to|i should|maybe|well|alright)\b", regex.I)
 RE_SYMBOLIC_DENSE = regex.compile(r"[=+\-*/^]|\\frac|\\sqrt|\\sum|\\int|\\prod|\\lim|\\binom|\\alpha|\\beta|\\gamma|\\pi|\\theta")
@@ -44,7 +48,6 @@ RE_CONT = regex.compile(
     r"^\s*(simplify|which simplifies|combine like terms|so now|now we have|therefore we can write|thus)\b",
     regex.I
 )
-
 
 ROLE_PATTERNS = {
     "plan": regex.compile(r"\b(plan|strategy|let'?s|we (?:will|shall)|first|next|then|step|approach|assume)\b", regex.I),
@@ -56,7 +59,6 @@ ROLE_PATTERNS = {
     "conclude": RE_CONCLUDE,
 }
 
-N = 2000
 # ---------------- 数据结构 ----------------
 @dataclass
 class Sentence:
@@ -88,32 +90,33 @@ def normalize(s: str) -> str:
     return s.strip()
 
 def strip_think(text: str) -> str:
-    m = RE_THINK.search(text)
-    return m.group(1).strip() if m else text
+    m = RE_THINK.search(text or "")
+    return m.group(1).strip() if m else (text or "")
 
 def extract_reasonings(example: Dict[str,Any]) -> List[str]:
-    """优先从 generations[*].content 的 <think>…</think> 取；否则回退到 solution。"""
+    """
+    针对你的文件格式：
+      1) 优先取 summary_answer_driven（字符串）
+      2) 若无，则回退到 traces_natural（列表[str]）
+      3) 再无，回退 solution
+    """
     outs = []
-    gens = example.get("generations")
-    if isinstance(gens, list) and gens:
-        for g in gens:
-            if isinstance(g, dict):
-                content = g.get("content") or ""
-            else:
-                content = str(g)
-            think = strip_think(content)
-            if think.strip():
-                outs.append(normalize(think))
-    if not outs:
-        sol = (example.get("solution") or "").strip()
-        if sol:
-            outs = [normalize(sol)]
+    if example.get("summary_answer_driven"):
+        t = strip_think(str(example["summary_answer_driven"]))
+        if t.strip():
+            outs.append(normalize(t))
+    if not outs and isinstance(example.get("traces_natural"), list):
+        for t in example["traces_natural"]:
+            t = strip_think(str(t))
+            if t.strip():
+                outs.append(normalize(t))
+    if not outs and (example.get("solution") or "").strip():
+        outs = [normalize(example["solution"])]
     return outs
 
 def extract_model_answer(text: str) -> Optional[str]:
-    """解析 reasoning 中的最后一个 \\boxed{...} 作为模型给出的答案。"""
-    m = list(RE_BOXED.finditer(text))
-    if not m: 
+    m = list(RE_BOXED.finditer(text or ""))
+    if not m:
         return None
     return f"\\boxed{{{m[-1].group(1).strip()}}}"
 
@@ -124,7 +127,6 @@ def answer_core(a: Optional[str]) -> Optional[str]:
     return a
 
 def mask_answer(text: str, gold: str) -> str:
-    """Answer Shield：遮蔽与 gold 等价的显式片段。"""
     if not gold: return text
     a_core = regex.sub(r"^\\boxed\{(.*)\}$", r"\1", gold).strip()
     esc = regex.escape(a_core)
@@ -149,12 +151,10 @@ def count_tokens(tok, s: str) -> int:
     return len(tok(s, add_special_tokens=False).input_ids)
 
 def split_sentences(reasoning_masked: str, tok) -> List[Sentence]:
-    """分句：保护 LaTeX；按换行/编号/句末符切；合并极短元话语并入后句；给出 char span + token 数。"""
     text = normalize(reasoning_masked)
     text_hold, blocks = hold_latex_blocks(text)
 
     rough=[]
-    # 粗按行
     for line in text_hold.split("\n"):
         line=line.strip()
         if not line: continue
@@ -168,10 +168,8 @@ def split_sentences(reasoning_masked: str, tok) -> List[Sentence]:
         tail=line[start:].strip()
         if tail: rough.append(tail)
 
-    # 还原 LaTeX
     rough=[restore_latex(s, blocks) for s in rough]
 
-    # 合并极短/元话语 → 并入后句
     merged=[]
     i=0
     while i<len(rough):
@@ -183,13 +181,11 @@ def split_sentences(reasoning_masked: str, tok) -> List[Sentence]:
         else:
             merged.append(seg); i += 1
 
-    # 生成 char spans（顺序匹配）
     sentences=[]
     cursor=0
     for idx, seg in enumerate(merged, start=1):
         pos = text.find(seg, cursor)
         if pos < 0:
-            # 回退：直接顺延
             pos = cursor
         start, end = pos, pos+len(seg)
         tok_n = count_tokens(tok, seg)
@@ -227,11 +223,9 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
         role = guess_role(text)
         has_eq = bool(RE_EQUATION.search(text) or RE_SYMBOLIC_DENSE.search(text))
         is_check = bool(RE_VERIFY.search(text))
-        # is_conc = bool(RE_CONCLUDE.search(text) or "\\boxed" in text)
-        # 结论判定时再额外加：或包含 \boxed
         is_conc = bool(RE_CONCLUDE.search(text) or "\\boxed" in text)
         tokens = count_tokens(tok, text)
-        feats = cheap_features(len(chunks)+1, 1, text, None)  # rel_pos 占位，稍后重算
+        feats = cheap_features(len(chunks)+1, 1, text, None)  # 先占位
         step = MacroStep(
             mid=len(chunks)+1,
             start_sid=buf[0].sid,
@@ -250,28 +244,23 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
     while i<n:
         s=sentences[i]; t=s.text
 
-        # 元话语并入后一句
         if RE_META.match(t) and i+1<n:
             buf.append(s); buf.append(sentences[i+1]); i+=2; flush(); continue
 
-        # 等式/代数化简连续合并
         if RE_EQUATION.search(t) or RE_SYMBOLIC_DENSE.search(t):
             buf.append(s); j=i+1
             while j<n and (RE_EQUATION.search(sentences[j].text) or RE_SYMBOLIC_DENSE.search(sentences[j].text)):
                 buf.append(sentences[j]); j+=1
             i=j; flush(); continue
 
-        # 验证段合并
         if RE_VERIFY.search(t):
             buf.append(s); take=min(3, n-(i+1))
             for k in range(take): buf.append(sentences[i+1+k])
             i += 1+take; flush(); continue
         
-        # 过渡句并入后句
         if RE_CONT.match(t) and i+1 < n:
             buf.append(s); buf.append(sentences[i+1]); i += 2; flush(); continue
 
-        # 结论类合并
         if RE_CONCLUDE.search(t) or "\\boxed" in t:
             buf.append(s)
             if i+1<n and (RE_CONCLUDE.search(sentences[i+1].text) or RE_VERIFY.search(sentences[i+1].text)):
@@ -280,46 +269,27 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
                 i+=1
             flush(); continue
 
-        # 默认：单句一步
         buf.append(s); i+=1; flush()
 
-    # 重算 rel_pos/cheap_score（依赖 n）
     total=len(chunks)
     for m in chunks:
         m.features = cheap_features(m.mid, total, m.text, None)
     return chunks
 
-def pick_correctness(ex: Dict[str,Any], gi:int, model_ans:str, gold:str) -> Tuple[Optional[bool], str]:
-    mv = ex.get("correctness_math_verify")
-    if isinstance(mv, list) and gi < len(mv) and mv[gi] is not None:
-        return bool(mv[gi]), "math_verify"
-    lj = ex.get("correctness_llama")
-    if isinstance(lj, list) and gi < len(lj) and lj[gi] is not None:
-        return bool(lj[gi]), "llama_judge"
-    # 回退：字符串等价（仅作兜底，不做严格数值等价）
-    if model_ans and gold:
-        return (answer_core(model_ans)==answer_core(gold)), "string_match"
-    return None, "unknown"
-
-
 def _count_tokens(text: str, tok=None) -> int:
     if tok is None:
-        return len(text.split())  # 兜底：空格分词
+        return len(text.split())
     try:
         return len(tok(text, add_special_tokens=False).input_ids)
     except Exception:
         return len(text.split())
 
 def _is_hard_boundary(a, b) -> bool:
-    """
-    永不跨越的边界：结论步、验算步、从引入/计划直接切到推导的首个等式。
-    """
     txt_a = (a.text or "").lower()
     txt_b = (b.text or "").lower()
     strong_a = ("\\boxed" in a.text) or ("final answer" in txt_a) or ("answer is" in txt_a)
     strong_b = ("\\boxed" in b.text) or ("final answer" in txt_b) or ("answer is" in txt_b)
 
-    # 仅尾部的验算才是硬边界
     ra = getattr(a, "features", {}).get("rel_pos", 0.0)
     rb = getattr(b, "features", {}).get("rel_pos", 0.0)
     tail_check = (a.is_check and ra >= 0.6) or (b.is_check and rb >= 0.6)
@@ -328,57 +298,36 @@ def _is_hard_boundary(a, b) -> bool:
     return strong_a or strong_b or tail_check or plan2derive
 
 def _boundary_cost(a, b) -> float:
-    """
-    合并代价：越小越优先合并。硬边界直接 +inf。
-    设计原则：优先吞掉短块、口癖/过渡句；避免跨大角色/等式变化的边界。
-    """
     if _is_hard_boundary(a, b):
         return inf
-
     cost = 0.0
-
-    # 角色变化的惩罚（derive 与 conclude/check/plan 之间的“跨域”更大）
     if a.role != b.role:
         if (a.role in {"derive", "intermediate"}) ^ (b.role in {"derive", "intermediate"}):
             cost += 0.9
         else:
             cost += 0.4
-
-    # 等式有无不一致：不鼓励合并
     if bool(a.has_equation) != bool(b.has_equation):
         cost += 0.8
-
-    # 短块奖励合并（任一非常短）
     if min(getattr(a, "tokens", 0), getattr(b, "tokens", 0)) < 18:
         cost -= 0.8
-
-    # 两侧字符都很短，再给点奖励
     if len(a.text) < 60 and len(b.text) < 60:
         cost -= 0.4
-
-    # 如果后一句是过渡/口癖句，进一步鼓励合并
     if RE_CONT.match(b.text):
         cost -= 0.3
-
-    # 长度差越大越不合并
     la, lb = max(1, len(a.text)), max(1, len(b.text))
     gap = abs(la - lb) / max(la, lb)
     cost += 0.2 * gap
-
     return cost
 
 def _merge_pair(a, b, tok=None):
-    """把相邻两块合并到 a 上，并更新关键字段。"""
     a.text = (a.text + " " + b.text).strip()
     a.end_sid = b.end_sid
     a.tokens = _count_tokens(a.text, tok)
     a.has_equation = bool(a.has_equation or b.has_equation)
     a.is_check = bool(a.is_check or b.is_check)
     a.is_conclusion = bool(a.is_conclusion or b.is_conclusion)
-    # role：尽量保留非 'other' 的有信息角色
     if a.role == "other" and b.role != "other":
         a.role = b.role
-    # features 简化更新（够用即可）
     feats = getattr(a, "features", {}) or {}
     feats["len_chars"] = len(a.text)
     feats["contains_boxed"] = int("\\boxed" in a.text)
@@ -386,14 +335,12 @@ def _merge_pair(a, b, tok=None):
     return a
 
 def _pack_by_token_budget(macros, tok=None, max_tokens=120):
-    """保险丝：按 token 上限顺序打包，同时尊重硬边界。"""
     if not macros:
         return macros
     new = []
     buf = macros[0]
     for i in range(1, len(macros)):
         cur = macros[i]
-        # 硬边界或打包超限：先收束，再开新块
         if _is_hard_boundary(buf, cur) or (_count_tokens(buf.text, tok) + _count_tokens(cur.text, tok) > max_tokens):
             new.append(buf)
             buf = cur
@@ -408,7 +355,6 @@ def _normalize_conclusion(macros):
             m.is_conclusion = True
             m.role = "conclude"
         else:
-            # 弱结论只做特征，不改 is_conclusion
             if RE_CONCLUDE.search(m.text or ""):
                 feats = getattr(m, "features", {}) or {}
                 feats["weak_conclude"] = 1
@@ -416,19 +362,11 @@ def _normalize_conclusion(macros):
     return macros
 
 def compress_macros(macros, tok=None, target_min=18, target_max=26):
-    """
-    在不引入新依赖的前提下，把步数压进 [target_min, target_max]。
-    做法：先标准化结论标签 -> 贪心合并 -> 若仍超标，走 token 预算打包。
-    """
     if not macros:
         return macros
 
-    # 1) 结论标准化（强/弱结论）
     macros = _normalize_conclusion(macros)
 
-    # 2) 贪心预算合并
-    #    每轮选取“代价最低”的相邻边界进行合并，直到步数落入目标区间
-    #    （或已无可合并边界）
     def _relabel_relpos(lst):
         n = max(1, len(lst))
         for i, m in enumerate(lst, 1):
@@ -441,56 +379,91 @@ def compress_macros(macros, tok=None, target_min=18, target_max=26):
 
     while len(macros) > target_max:
         best_i, best_cost = None, inf
-        # 扫一遍所有相邻边界
         for i in range(len(macros) - 1):
             c = _boundary_cost(macros[i], macros[i + 1])
             if c < best_cost:
                 best_cost, best_i = c, i
-        # 没有可合并的边界（都为硬边界），跳保险丝
         if best_i is None or best_cost == inf:
             break
-        # 合并最佳对
         merged = _merge_pair(macros[best_i], macros[best_i + 1], tok)
         macros[best_i] = merged
         macros.pop(best_i + 1)
 
-    # 3) 保险丝：如果仍超标，用 token 预算顺序打包（尊重硬边界）
     if len(macros) > target_max:
         macros = _pack_by_token_budget(macros, tok, max_tokens=90)
 
-    # 4) 最终重排 mid / rel_pos
     _relabel_relpos(macros)
     return macros
+
+def pick_correctness(ex: Dict[str,Any], gi:int, model_ans:str, gold:str) -> Tuple[Optional[bool], str]:
+    # 你的JSONL没有显式 correctness 标注，这里仅做字符串兜底
+    if model_ans and gold:
+        return (answer_core(model_ans)==answer_core(gold)), "string_match"
+    return None, "unknown"
 
 # ---------------- 主流程 ----------------
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    print(f"Loading dataset open-r1/OpenR1-Math-220k ({args.split}) ...")
-    ds = load_dataset("open-r1/OpenR1-Math-220k", args.split, split="train")
+    # ========== 数据加载 ==========
+    if args.input_jsonl:
+        print(f"Loading summaries from JSONL: {args.input_jsonl}")
+        records = []
+        with open(args.input_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip(): continue
+                obj = json.loads(line)
+
+                # 字段名兼容映射（结合你的文件格式）
+                # uuid
+                obj.setdefault("uuid", obj.get("id"))
+                # 题目
+                obj.setdefault("problem", obj.get("question") or "")
+                # 金答案（文件中叫 final_answer）
+                obj.setdefault("answer", obj.get("final_answer") or "")
+                # solution_human 若无则空串
+                obj.setdefault("solution", obj.get("solution_human") or "")
+
+                records.append(obj)
+        ds_iter = records
+        total_len = len(records)
+        print(f"Loaded {total_len} records from JSONL")
+    else:
+        print(f"Loading dataset open-r1/OpenR1-Math-220k ({args.split}) ...")
+        ds = load_dataset("open-r1/OpenR1-Math-220k", args.split, split="train")
+        ds_iter = ds
+        total_len = len(ds)
 
     # tokenizer
-    tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    tokenizer_id = args.tokenizer
+    use_local = os.path.isdir(tokenizer_id)  # 传目录→本地
+    tok = AutoTokenizer.from_pretrained(
+        tokenizer_id,
+        use_fast=True,
+        trust_remote_code=True,
+        local_files_only=use_local
+    )
+    # limit
+    run_len = args.limit if (args.limit and args.limit > 0) else total_len
 
-    # 展开：一题→多轨迹
+    # 展开：一题→多轨迹（此处 summary_answer_driven 只有 1 条）
     rows=[]
-    for ex in tqdm(islice(ds, N), total=N, desc="Expanding problems → traces"):
+    iterable = islice(ds_iter, run_len) if run_len is not None else ds_iter
+    for ex in tqdm(iterable, total=run_len, desc="Expanding problems → traces"):
         reasonings = extract_reasonings(ex)
         for gi, r in enumerate(reasonings):
             rows.append({
                 "uuid": ex.get("uuid"),
                 "problem": ex.get("problem"),
                 "solution_human": ex.get("solution") or "",
-                "answer_gold": ex.get("answer") or "",
+                "answer_gold": (ex.get("answer") or ex.get("answer_gold") or ex.get("gold_answer") or ""),
                 "source": ex.get("source"),
                 "generations_len": len(reasonings),
                 "gen_index": gi,
-                "finish_reasons": (ex.get("finish_reasons") or [None]*len(reasonings))
+                "finish_reasons": (ex.get("finish_reasons") or [None]*len(reasonings)),
+                "reasoning_raw": r
             })
-            rows[-1]["reasoning_raw"] = r
-
-    if args.limit>0: rows = rows[:args.limit]
     print(f"Expanded to {len(rows)} problem-traces")
 
     # 三文件 writers
@@ -507,20 +480,21 @@ def main():
         masked = mask_answer(ex["reasoning_raw"], ex["answer_gold"])
 
         # token 计数
-        n_prompt = count_tokens(tok, ex["problem"] or "")
-        n_r_raw = count_tokens(tok, ex["reasoning_raw"])
-        n_r_mask = count_tokens(tok, masked)
-        n_ans_model = count_tokens(tok, model_ans or "")
-        n_sol_human = count_tokens(tok, ex["solution_human"] or "")
+        tok_inst = tok
+        n_prompt = count_tokens(tok_inst, ex["problem"] or "")
+        n_r_raw = count_tokens(tok_inst, ex["reasoning_raw"])
+        n_r_mask = count_tokens(tok_inst, masked)
+        n_ans_model = count_tokens(tok_inst, model_ans or "")
+        n_sol_human = count_tokens(tok_inst, ex["solution_human"] or "")
 
         # 分句
-        sents = split_sentences(masked, tok)
+        sents = split_sentences(masked, tok_inst)
 
         # 宏步骤
-        macros = macro_chunk(sents, tok)
-        macros = compress_macros(macros, tok, target_min=18, target_max=26)
+        macros = macro_chunk(sents, tok_inst)
+        # macros = compress_macros(macros, tok_inst, target_min=args.target_min, target_max=args.target_max)
 
-        # 补全 features 中对答案的支持提示（用 gold 核心作 hint）
+        # features：补全支持提示
         gold_core = answer_core(ex["answer_gold"])
         for m in macros:
             feats = m.features
@@ -553,8 +527,11 @@ def main():
             "tokens_model_answer": n_ans_model,
             "tokens_solution_human": n_sol_human,
             "tokenizer": args.tokenizer,
-            "finish_reason": (ex["finish_reasons"][ex["gen_index"]] 
-                              if isinstance(ex["finish_reasons"], list) and ex["gen_index"]<len(ex["finish_reasons"]) else None)
+            "finish_reason": (
+                ex["finish_reasons"][ex["gen_index"]]
+                if isinstance(ex["finish_reasons"], list) and ex["gen_index"]<len(ex["finish_reasons"])
+                else None
+            )
         }
         fp_raw.write(json.dumps(rec_raw, ensure_ascii=False) + "\n")
 

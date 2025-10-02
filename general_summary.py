@@ -37,6 +37,7 @@ FINAL_ANS_PATTERNS = [
 
 # ===================== Utilities =====================
 
+
 def strip_think(resp: str) -> str:
     """移除 <think>…</think> 段，得到用户可见部分。"""
     return THINK_TAG_RE.sub("", resp or "").strip()
@@ -127,6 +128,7 @@ def main():
     ap.add_argument("--offline", action="store_true",
                     help="设置 HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE=1")
 
+
     args = ap.parse_args()
 
     if args.offline:
@@ -148,20 +150,56 @@ def main():
             break
         rows.append(row)
 
+    def _tok_len(tok, text: str) -> int:
+        return len(tok.encode(text or "", add_special_tokens=False))
 
+    tok_for_len = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+    overhead_tokens = 128  # 模板等保守预留
+    skipped = []           # 记录被跳过的样本
     # 字段：glaive 数据集为 prompt / response
     problems, final_answers, traces_list, raw_responses, sample_ids = [], [], [], [], []
     for i, row in enumerate(rows):
         q = (row.get("prompt") or "").strip()
         resp = (row.get("response") or "").strip()
-        traces = extract_traces_from_response(resp)
+
         visible_ans = extract_final_answer(resp)
+
+        # 计算 token 数
+        q_len = len(tok_for_len.encode(q, add_special_tokens=False))
+        a_len = len(tok_for_len.encode(visible_ans, add_special_tokens=False))
+
+        # 允许的总预算（不得超过 max_model_len）
+        total_len = overhead_tokens + q_len + a_len + args.max_tokens
+        if total_len > args.max_model_len:
+            # 直接跳过，并记录
+            skipped.append({
+                "sample_id": i,
+                "q_len": q_len,
+                "a_len": a_len,
+                "total_with_overhead_plus_gen": total_len,
+                "max_model_len": args.max_model_len,
+            })
+            continue  # ← 别忘了继续下一条
+
+        # 需要保留自然轨迹就抽取；不需要的话可改为 []
+        traces = extract_traces_from_response(resp)
+
+        # ✅ 这几行必须在 for 循环里面
         problems.append(q)
         final_answers.append(visible_ans)
-        traces_list.append(traces)
         raw_responses.append(resp)
+        traces_list.append(traces)
         sample_ids.append(i)
 
+    # 写出跳过样本日志（与主输出同名，后缀改为 .skipped.jsonl）
+    out_path = Path(args.out)
+    skipped_log = out_path.with_suffix(".skipped.jsonl")
+    with open(skipped_log, "w", encoding="utf-8") as f:
+        for rec in skipped:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"[filter] kept={len(problems)} skipped={len(skipped)} (log: {skipped_log})", file=sys.stderr)
     # ==== 构造输入 ====
     inputs_messages = [build_messages(q, a) for q, a in zip(problems, final_answers)]
     tokenizer = None
