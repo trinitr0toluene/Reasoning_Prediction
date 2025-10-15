@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from math import inf
 
 import regex
+from unidecode import unidecode
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from itertools import islice
@@ -13,22 +14,15 @@ from tqdm import tqdm  # 进度条
 # ---------------- CLI ----------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    # 若不使用本地JSONL，可继续用原HF数据集
     ap.add_argument("--split", default="default", choices=["default","extended","all"])
     ap.add_argument("--tokenizer", default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct")
     ap.add_argument("--topk", type=int, default=0, help="为宏步骤预筛的个数（0=不筛）")
-    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/new_prompt/summary")
+    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/general")
     ap.add_argument("--limit", type=int, default=2000, help="仅处理前N条（调试）")
-
-    # 新增：本地 JSONL（已与你的文件对齐）
-    ap.add_argument("--input_jsonl", type=str,
-                    # default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
-                    default = "/root/autodl-fs/out2000/new_prompt/math/out_openr1_answer_summaries.jsonl",
-                    help="从该 JSONL 读取样本（支持 summary_answer_driven / traces_natural）")
-
-    # 新增：summary 较短，适当收紧目标步数
-    ap.add_argument("--target_min", type=int, default=8)
-    ap.add_argument("--target_max", type=int, default=16)
+    ap.add_argument("--input_jsonl", type=str, default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
+                    help="从本地 JSONL 读取样本（支持字段 traces_natural / problem / answer 等）")
+    ap.add_argument("--lines_as_steps", type=int, default=1,
+                    help="=1 时按换行直接当作 step；=0 时走原 sentence→macro 分块")
     return ap.parse_args()
 
 # ---------------- 正则/模式 ----------------
@@ -59,6 +53,8 @@ ROLE_PATTERNS = {
     "check": RE_VERIFY,
     "conclude": RE_CONCLUDE,
 }
+
+N = 2000
 
 # ---------------- 数据结构 ----------------
 @dataclass
@@ -91,33 +87,12 @@ def normalize(s: str) -> str:
     return s.strip()
 
 def strip_think(text: str) -> str:
-    m = RE_THINK.search(text or "")
-    return m.group(1).strip() if m else (text or "")
-
-def extract_reasonings(example: Dict[str,Any]) -> List[str]:
-    """
-    针对你的文件格式：
-      1) 优先取 summary_answer_driven（字符串）
-      2) 若无，则回退到 traces_natural（列表[str]）
-      3) 再无，回退 solution
-    """
-    outs = []
-    if example.get("summary_answer_driven"):
-        t = strip_think(str(example["summary_answer_driven"]))
-        if t.strip():
-            outs.append(normalize(t))
-    if not outs and isinstance(example.get("traces_natural"), list):
-        for t in example["traces_natural"]:
-            t = strip_think(str(t))
-            if t.strip():
-                outs.append(normalize(t))
-    if not outs and (example.get("solution") or "").strip():
-        outs = [normalize(example["solution"])]
-    return outs
+    m = RE_THINK.search(text)
+    return m.group(1).strip() if m else text
 
 def extract_model_answer(text: str) -> Optional[str]:
-    m = list(RE_BOXED.finditer(text or ""))
-    if not m:
+    m = list(RE_BOXED.finditer(text))
+    if not m: 
         return None
     return f"\\boxed{{{m[-1].group(1).strip()}}}"
 
@@ -151,6 +126,7 @@ def restore_latex(s: str, blocks: List[str]) -> str:
 def count_tokens(tok, s: str) -> int:
     return len(tok(s, add_special_tokens=False).input_ids)
 
+# -------- 原 sentence 分句（备用） --------
 def split_sentences(reasoning_masked: str, tok) -> List[Sentence]:
     text = normalize(reasoning_masked)
     text_hold, blocks = hold_latex_blocks(text)
@@ -194,6 +170,23 @@ def split_sentences(reasoning_masked: str, tok) -> List[Sentence]:
         cursor = end
     return sentences
 
+# -------- 新增：按行即句（一步一行） --------
+def sentences_from_lines(reasoning_masked: str, tok) -> List[Sentence]:
+    """
+    对于 glaive 的 traces_natural：每个非空换行 = 一个最小单元（直接当作 step）。
+    """
+    text = normalize(reasoning_masked)
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    sentences=[]
+    cursor=0
+    for idx, seg in enumerate(lines, start=1):
+        pos = text.find(seg, cursor)
+        if pos < 0: pos = cursor
+        start, end = pos, pos + len(seg)
+        sentences.append(Sentence(idx, seg, start, end, count_tokens(tok, seg)))
+        cursor = end
+    return sentences
+
 def guess_role(text: str) -> str:
     for role, pat in ROLE_PATTERNS.items():
         if pat.search(text):
@@ -213,6 +206,7 @@ def cheap_features(mid:int, total:int, text:str, ans_core:str) -> Dict[str,Any]:
     feats["cheap_score"] = round(min(1.0, score),3)
     return feats
 
+# -------- 原 macro pipeline（备用） --------
 def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
     chunks=[]
     buf: List[Sentence]=[]
@@ -226,7 +220,7 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
         is_check = bool(RE_VERIFY.search(text))
         is_conc = bool(RE_CONCLUDE.search(text) or "\\boxed" in text)
         tokens = count_tokens(tok, text)
-        feats = cheap_features(len(chunks)+1, 1, text, None)  # 先占位
+        feats = cheap_features(len(chunks)+1, 1, text, None)
         step = MacroStep(
             mid=len(chunks)+1,
             start_sid=buf[0].sid,
@@ -244,24 +238,19 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
     i=0; n=len(sentences)
     while i<n:
         s=sentences[i]; t=s.text
-
         if RE_META.match(t) and i+1<n:
             buf.append(s); buf.append(sentences[i+1]); i+=2; flush(); continue
-
         if RE_EQUATION.search(t) or RE_SYMBOLIC_DENSE.search(t):
             buf.append(s); j=i+1
             while j<n and (RE_EQUATION.search(sentences[j].text) or RE_SYMBOLIC_DENSE.search(sentences[j].text)):
                 buf.append(sentences[j]); j+=1
             i=j; flush(); continue
-
         if RE_VERIFY.search(t):
             buf.append(s); take=min(3, n-(i+1))
             for k in range(take): buf.append(sentences[i+1+k])
             i += 1+take; flush(); continue
-        
         if RE_CONT.match(t) and i+1 < n:
             buf.append(s); buf.append(sentences[i+1]); i += 2; flush(); continue
-
         if RE_CONCLUDE.search(t) or "\\boxed" in t:
             buf.append(s)
             if i+1<n and (RE_CONCLUDE.search(sentences[i+1].text) or RE_VERIFY.search(sentences[i+1].text)):
@@ -269,7 +258,6 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
             else:
                 i+=1
             flush(); continue
-
         buf.append(s); i+=1; flush()
 
     total=len(chunks)
@@ -277,24 +265,14 @@ def macro_chunk(sentences: List[Sentence], tok) -> List[MacroStep]:
         m.features = cheap_features(m.mid, total, m.text, None)
     return chunks
 
-def _count_tokens(text: str, tok=None) -> int:
-    if tok is None:
-        return len(text.split())
-    try:
-        return len(tok(text, add_special_tokens=False).input_ids)
-    except Exception:
-        return len(text.split())
-
 def _is_hard_boundary(a, b) -> bool:
     txt_a = (a.text or "").lower()
     txt_b = (b.text or "").lower()
     strong_a = ("\\boxed" in a.text) or ("final answer" in txt_a) or ("answer is" in txt_a)
     strong_b = ("\\boxed" in b.text) or ("final answer" in txt_b) or ("answer is" in txt_b)
-
     ra = getattr(a, "features", {}).get("rel_pos", 0.0)
     rb = getattr(b, "features", {}).get("rel_pos", 0.0)
     tail_check = (a.is_check and ra >= 0.6) or (b.is_check and rb >= 0.6)
-
     plan2derive = (a.role in {"introduce","plan"}) and (b.role in {"derive","intermediate"}) and b.has_equation
     return strong_a or strong_b or tail_check or plan2derive
 
@@ -313,8 +291,6 @@ def _boundary_cost(a, b) -> float:
         cost -= 0.8
     if len(a.text) < 60 and len(b.text) < 60:
         cost -= 0.4
-    if RE_CONT.match(b.text):
-        cost -= 0.3
     la, lb = max(1, len(a.text)), max(1, len(b.text))
     gap = abs(la - lb) / max(la, lb)
     cost += 0.2 * gap
@@ -323,7 +299,7 @@ def _boundary_cost(a, b) -> float:
 def _merge_pair(a, b, tok=None):
     a.text = (a.text + " " + b.text).strip()
     a.end_sid = b.end_sid
-    a.tokens = _count_tokens(a.text, tok)
+    a.tokens = len(a.text.split()) if tok is None else len(tok(a.text, add_special_tokens=False).input_ids)
     a.has_equation = bool(a.has_equation or b.has_equation)
     a.is_check = bool(a.is_check or b.is_check)
     a.is_conclusion = bool(a.is_conclusion or b.is_conclusion)
@@ -342,9 +318,10 @@ def _pack_by_token_budget(macros, tok=None, max_tokens=120):
     buf = macros[0]
     for i in range(1, len(macros)):
         cur = macros[i]
-        if _is_hard_boundary(buf, cur) or (_count_tokens(buf.text, tok) + _count_tokens(cur.text, tok) > max_tokens):
-            new.append(buf)
-            buf = cur
+        cur_len = len(buf.text.split()) if tok is None else len(tok(buf.text, add_special_tokens=False).input_ids)
+        nxt_len = len(cur.text.split()) if tok is None else len(tok(cur.text, add_special_tokens=False).input_ids)
+        if _is_hard_boundary(buf, cur) or (cur_len + nxt_len > max_tokens):
+            new.append(buf); buf = cur
         else:
             buf = _merge_pair(buf, cur, tok)
     new.append(buf)
@@ -365,7 +342,6 @@ def _normalize_conclusion(macros):
 def compress_macros(macros, tok=None, target_min=18, target_max=26):
     if not macros:
         return macros
-
     macros = _normalize_conclusion(macros)
 
     def _relabel_relpos(lst):
@@ -396,45 +372,90 @@ def compress_macros(macros, tok=None, target_min=18, target_max=26):
     _relabel_relpos(macros)
     return macros
 
+# -------- 新增：直接由“行句”生成宏步骤 --------
+def macros_from_line_sentences(sentences: List[Sentence], tok) -> List[MacroStep]:
+    total = max(1, len(sentences))
+    macros=[]
+    for i, s in enumerate(sentences, start=1):
+        text = s.text
+        role = guess_role(text)
+        has_eq = bool(RE_EQUATION.search(text) or RE_SYMBOLIC_DENSE.search(text))
+        is_check = bool(RE_VERIFY.search(text))
+        is_conc = bool(RE_CONCLUDE.search(text) or "\\boxed" in text)
+        tokens = count_tokens(tok, text)
+        feats = cheap_features(i, total, text, None)
+        macros.append(MacroStep(
+            mid=i,
+            start_sid=s.sid,
+            end_sid=s.sid,
+            text=text,
+            role=role,
+            has_equation=has_eq,
+            is_check=is_check,
+            is_conclusion=is_conc,
+            tokens=tokens,
+            features=feats
+        ))
+    return macros
+
+# -------- 兼容 correctness 的兜底 --------
 def pick_correctness(ex: Dict[str,Any], gi:int, model_ans:str, gold:str) -> Tuple[Optional[bool], str]:
-    # 你的JSONL没有显式 correctness 标注，这里仅做字符串兜底
+    mv = ex.get("correctness_math_verify")
+    if isinstance(mv, list) and gi < len(mv) and mv[gi] is not None:
+        return bool(mv[gi]), "math_verify"
+    lj = ex.get("correctness_llama")
+    if isinstance(lj, list) and gi < len(lj) and lj[gi] is not None:
+        return bool(lj[gi]), "llama_judge"
     if model_ans and gold:
         return (answer_core(model_ans)==answer_core(gold)), "string_match"
     return None, "unknown"
+
+# ---------------- 读取输入 ----------------
+def read_jsonl(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+def extract_reasonings_from_record(ex: Dict[str,Any]) -> List[str]:
+    """
+    优先使用 traces_natural（string 或 list）。否则回退到 generations / solution。
+    """
+    outs=[]
+    tn = ex.get("traces_natural")
+    if tn:
+        if isinstance(tn, list):
+            for t in tn:
+                if t and str(t).strip():
+                    outs.append(normalize(str(t)))
+        else:
+            outs.append(normalize(str(tn)))
+
+    if outs:
+        return outs
+
+    # 回退路径（为了通用性保留）
+    gens = ex.get("generations")
+    if isinstance(gens, list) and gens:
+        for g in gens:
+            content = g.get("content") if isinstance(g, dict) else str(g)
+            think = strip_think(content or "")
+            if think.strip():
+                outs.append(normalize(think))
+    if not outs:
+        sol = (ex.get("solution") or "").strip()
+        if sol:
+            outs = [normalize(sol)]
+    return outs
 
 # ---------------- 主流程 ----------------
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
-
-    # ========== 数据加载 ==========
-    if args.input_jsonl:
-        print(f"Loading summaries from JSONL: {args.input_jsonl}")
-        records = []
-        with open(args.input_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip(): continue
-                obj = json.loads(line)
-
-                # 字段名兼容映射（结合你的文件格式）
-                # uuid
-                obj.setdefault("uuid", obj.get("id"))
-                # 题目
-                obj.setdefault("problem", obj.get("question") or "")
-                # 金答案（文件中叫 final_answer）
-                obj.setdefault("answer", obj.get("final_answer") or "")
-                # solution_human 若无则空串
-                obj.setdefault("solution", obj.get("solution_human") or "")
-
-                records.append(obj)
-        ds_iter = records
-        total_len = len(records)
-        print(f"Loaded {total_len} records from JSONL")
-    else:
-        print(f"Loading dataset open-r1/OpenR1-Math-220k ({args.split}) ...")
-        ds = load_dataset("open-r1/OpenR1-Math-220k", args.split, split="train")
-        ds_iter = ds
-        total_len = len(ds)
 
     # tokenizer
     tokenizer_id = args.tokenizer
@@ -445,26 +466,50 @@ def main():
         trust_remote_code=True,
         local_files_only=use_local
     )
-    # limit
-    run_len = args.limit if (args.limit and args.limit > 0) else total_len
 
-    # 展开：一题→多轨迹（此处 summary_answer_driven 只有 1 条）
     rows=[]
-    iterable = islice(ds_iter, run_len) if run_len is not None else ds_iter
-    for ex in tqdm(iterable, total=run_len, desc="Expanding problems → traces"):
-        reasonings = extract_reasonings(ex)
-        for gi, r in enumerate(reasonings):
-            rows.append({
-                "uuid": ex.get("uuid"),
-                "problem": ex.get("problem"),
-                "solution_human": ex.get("solution") or "",
-                "answer_gold": (ex.get("answer") or ex.get("answer_gold") or ex.get("gold_answer") or ""),
-                "source": ex.get("source"),
-                "generations_len": len(reasonings),
-                "gen_index": gi,
-                "finish_reasons": (ex.get("finish_reasons") or [None]*len(reasonings)),
-                "reasoning_raw": r
-            })
+    if args.input_jsonl:
+        # 本地 JSONL（glaive）
+        print(f"Loading local JSONL: {args.input_jsonl}")
+        for idx, ex in enumerate(read_jsonl(args.input_jsonl)):
+            reasonings = extract_reasonings_from_record(ex)
+            if not reasonings:
+                continue
+            for gi, r in enumerate(reasonings):
+                rows.append({
+                    "uuid": ex.get("uuid") or ex.get("id") or f"glaive-{idx}",
+                    "problem": ex.get("problem") or ex.get("question") or ex.get("prompt") or "",
+                    "solution_human": ex.get("solution") or "",
+                    "answer_gold": ex.get("answer") or ex.get("final_answer") or "",
+                    "source": ex.get("source") or "glaive",
+                    "generations_len": len(reasonings),
+                    "gen_index": gi,
+                    "finish_reasons": ex.get("finish_reasons") or [None]*len(reasonings),
+                    "reasoning_raw": r
+                })
+            if args.limit and len(rows) >= args.limit:
+                rows = rows[:args.limit]
+                break
+    else:
+        # 兼容原 open-r1 数据集用法（无输入文件）
+        print(f"Loading dataset open-r1/OpenR1-Math-220k ({args.split}) ...")
+        ds = load_dataset("open-r1/OpenR1-Math-220k", args.split, split="train")
+        for ex in tqdm(islice(ds, N), total=N, desc="Expanding problems → traces"):
+            gens = extract_reasonings_from_record(ex)
+            for gi, r in enumerate(gens):
+                rows.append({
+                    "uuid": ex.get("uuid"),
+                    "problem": ex.get("problem"),
+                    "solution_human": ex.get("solution") or "",
+                    "answer_gold": ex.get("answer") or "",
+                    "source": ex.get("source"),
+                    "generations_len": len(gens),
+                    "gen_index": gi,
+                    "finish_reasons": (ex.get("finish_reasons") or [None]*len(gens)),
+                    "reasoning_raw": r
+                })
+        if args.limit>0: rows = rows[:args.limit]
+
     print(f"Expanded to {len(rows)} problem-traces")
 
     # 三文件 writers
@@ -481,21 +526,26 @@ def main():
         masked = mask_answer(ex["reasoning_raw"], ex["answer_gold"])
 
         # token 计数
-        tok_inst = tok
-        n_prompt = count_tokens(tok_inst, ex["problem"] or "")
-        n_r_raw = count_tokens(tok_inst, ex["reasoning_raw"])
-        n_r_mask = count_tokens(tok_inst, masked)
-        n_ans_model = count_tokens(tok_inst, model_ans or "")
-        n_sol_human = count_tokens(tok_inst, ex["solution_human"] or "")
+        n_prompt = count_tokens(tok, ex["problem"] or "")
+        n_r_raw = count_tokens(tok, ex["reasoning_raw"])
+        n_r_mask = count_tokens(tok, masked)
+        n_ans_model = count_tokens(tok, model_ans or "")
+        n_sol_human = count_tokens(tok, ex["solution_human"] or "")
 
-        # 分句
-        sents = split_sentences(masked, tok_inst)
+        # 分句/按行
+        if args.lines_as_steps:
+            sents = sentences_from_lines(masked, tok)
+        else:
+            sents = split_sentences(masked, tok)
 
         # 宏步骤
-        macros = macro_chunk(sents, tok_inst)
-        # macros = compress_macros(macros, tok_inst, target_min=args.target_min, target_max=args.target_max)
+        if args.lines_as_steps:
+            macros = macros_from_line_sentences(sents, tok)
+        else:
+            macros = macro_chunk(sents, tok)
+            macros = compress_macros(macros, tok, target_min=18, target_max=26)
 
-        # features：补全支持提示
+        # 根据 gold 核心值补特征
         gold_core = answer_core(ex["answer_gold"])
         for m in macros:
             feats = m.features
@@ -528,11 +578,8 @@ def main():
             "tokens_model_answer": n_ans_model,
             "tokens_solution_human": n_sol_human,
             "tokenizer": args.tokenizer,
-            "finish_reason": (
-                ex["finish_reasons"][ex["gen_index"]]
-                if isinstance(ex["finish_reasons"], list) and ex["gen_index"]<len(ex["finish_reasons"])
-                else None
-            )
+            "finish_reason": (ex["finish_reasons"][ex["gen_index"]] 
+                              if isinstance(ex["finish_reasons"], list) and ex["gen_index"]<len(ex["finish_reasons"]) else None)
         }
         fp_raw.write(json.dumps(rec_raw, ensure_ascii=False) + "\n")
 

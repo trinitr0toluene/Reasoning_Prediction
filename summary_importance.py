@@ -649,13 +649,14 @@ def main():
     # data (two modes; summary first)
     parser.add_argument("--summary-jsonl", type=str, default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
                         help="If provided, the script reads from this file and segments steps on the fly.")
-    parser.add_argument("--raw-masked", type=str, default="/root/autodl-tmp/out200/summary/raw_masked.jsonl")
-    parser.add_argument("--macro-steps", type=str, default="/root/autodl-tmp/out200/summary/macro_steps.jsonl")
-    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out200/summary/sentences.jsonl")
+    # parser.add_argument("--raw-masked", type=str, default="/root/autodl-tmp/out200/summary/raw_masked.jsonl")
+    parser.add_argument("--raw-masked", type=str, default = "/root/autodl-tmp/out2000/new_prompt/summary/raw_masked.jsonl")
+    parser.add_argument("--macro-steps", type=str, default="/root/autodl-tmp/out2000/new_prompt/summary/macro_steps.jsonl")
+    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out200/new_prompt/summary/sentences.jsonl")
 
     # behavior
     parser.add_argument("--granularity", type=str, choices=["macro", "sentence"], default="sentence")
-    parser.add_argument("--out", type=str, default="/root/autodl-fs/out200/summary/math/ablation_from_summary.jsonl")
+    parser.add_argument("--out", type=str, default="/root/autodl-fs/out2000/new_prompt/summary/math/ablation_from_summary.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--bsz", type=int, default=32)
     parser.add_argument("--limit", type=int, default=2000)
