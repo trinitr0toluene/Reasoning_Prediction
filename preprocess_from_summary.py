@@ -17,16 +17,19 @@ def parse_args():
     ap.add_argument("--split", default="default", choices=["default","extended","all"])
     ap.add_argument("--tokenizer", default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct")
     ap.add_argument("--topk", type=int, default=0, help="为宏步骤预筛的个数（0=不筛）")
-    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/new_prompt/summary")
+    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/math")
     ap.add_argument("--limit", type=int, default=2000, help="仅处理前N条（调试）")
 
-    # 新增：本地 JSONL（已与你的文件对齐）
+    # 本地 JSONL（包含 summary_* 与 traces_* 字段）
     ap.add_argument("--input_jsonl", type=str,
-                    # default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
-                    default = "/root/autodl-fs/out2000/new_prompt/math/out_openr1_answer_summaries.jsonl",
-                    help="从该 JSONL 读取样本（支持 summary_answer_driven / traces_natural）")
+                    default="/root/autodl-fs/out2000/A+Q+RT/math/out_openr1_answer_summaries.jsonl",
+                    help="从该 JSONL 读取样本（支持 summary_trace_augmented / summary_answer_driven / traces_natural / traces_used_in_prompt）")
 
-    # 新增：summary 较短，适当收紧目标步数
+    # 选择用于分句/宏步骤分析的来源
+    ap.add_argument("--prefer", choices=["summary","traces","solution"], default="summary",
+                    help="优先从何种来源形成待分析文本：summary(默认)/traces/solution")
+
+    # summary 较短，适当收紧目标步数（如需后续压缩可开启）
     ap.add_argument("--target_min", type=int, default=8)
     ap.add_argument("--target_max", type=int, default=16)
     return ap.parse_args()
@@ -94,25 +97,66 @@ def strip_think(text: str) -> str:
     m = RE_THINK.search(text or "")
     return m.group(1).strip() if m else (text or "")
 
-def extract_reasonings(example: Dict[str,Any]) -> List[str]:
+def extract_reasonings(example: Dict[str,Any], prefer: str = "summary") -> List[Dict[str,str]]:
     """
-    针对你的文件格式：
-      1) 优先取 summary_answer_driven（字符串）
-      2) 若无，则回退到 traces_natural（列表[str]）
-      3) 再无，回退 solution
+    返回用于分析的一组文本片段，每个元素含:
+      {"text": <用于分句/宏步骤的内容>, "source": <来源标签>}
+    优先级（默认 prefer='summary'）:
+      1) summary_trace_augmented
+      2) summary_answer_driven
+      3) traces_natural（多条）
+      4) solution / solution_human
+    若 prefer='traces' 则先取 traces_natural（多条）→ 其余为回退
+    若 prefer='solution' 则先取 solution → 其余为回退
     """
-    outs = []
-    if example.get("summary_answer_driven"):
-        t = strip_think(str(example["summary_answer_driven"]))
-        if t.strip():
-            outs.append(normalize(t))
-    if not outs and isinstance(example.get("traces_natural"), list):
-        for t in example["traces_natural"]:
-            t = strip_think(str(t))
-            if t.strip():
-                outs.append(normalize(t))
-    if not outs and (example.get("solution") or "").strip():
-        outs = [normalize(example["solution"])]
+    outs: List[Dict[str,str]] = []
+    # 标准化可用字段
+    summary_aug = (example.get("summary_trace_augmented") or "").strip()
+    summary_ans = (example.get("summary_answer_driven") or "").strip()
+    traces_nat = example.get("traces_natural") if isinstance(example.get("traces_natural"), list) else []
+    solution = (example.get("solution") or example.get("solution_human") or "").strip()
+
+    def _append_text(text: str, source: str):
+        t = strip_think(str(text))
+        t = normalize(t)
+        if t:
+            outs.append({"text": t, "source": source})
+
+    if prefer == "traces":
+        if traces_nat:
+            for t in traces_nat:
+                _append_text(t, "traces_natural")
+        elif summary_aug:
+            _append_text(summary_aug, "summary_trace_augmented")
+        elif summary_ans:
+            _append_text(summary_ans, "summary_answer_driven")
+        elif solution:
+            _append_text(solution, "solution")
+        return outs
+
+    if prefer == "solution":
+        if solution:
+            _append_text(solution, "solution")
+        elif summary_aug:
+            _append_text(summary_aug, "summary_trace_augmented")
+        elif summary_ans:
+            _append_text(summary_ans, "summary_answer_driven")
+        elif traces_nat:
+            for t in traces_nat:
+                _append_text(t, "traces_natural")
+        return outs
+
+    # prefer == "summary"
+    if summary_aug:
+        _append_text(summary_aug, "summary_trace_augmented")
+    elif summary_ans:
+        _append_text(summary_ans, "summary_answer_driven")
+    elif traces_nat:
+        for t in traces_nat:
+            _append_text(t, "traces_natural")
+    elif solution:
+        _append_text(solution, "solution")
+
     return outs
 
 def extract_model_answer(text: str) -> Optional[str]:
@@ -397,7 +441,7 @@ def compress_macros(macros, tok=None, target_min=18, target_max=26):
     return macros
 
 def pick_correctness(ex: Dict[str,Any], gi:int, model_ans:str, gold:str) -> Tuple[Optional[bool], str]:
-    # 你的JSONL没有显式 correctness 标注，这里仅做字符串兜底
+    # 无显式 correctness 标注，这里仅做字符串兜底
     if model_ans and gold:
         return (answer_core(model_ans)==answer_core(gold)), "string_match"
     return None, "unknown"
@@ -448,11 +492,19 @@ def main():
     # limit
     run_len = args.limit if (args.limit and args.limit > 0) else total_len
 
-    # 展开：一题→多轨迹（此处 summary_answer_driven 只有 1 条）
+    # 展开：一题→多轨迹（summary 情况下一般 1 条；traces 情况下可能多条）
     rows=[]
     iterable = islice(ds_iter, run_len) if run_len is not None else ds_iter
-    for ex in tqdm(iterable, total=run_len, desc="Expanding problems → traces"):
-        reasonings = extract_reasonings(ex)
+    for ex in tqdm(iterable, total=run_len, desc="Expanding problems → reasonings"):
+        reasonings = extract_reasonings(ex, prefer=args.prefer)  # [{text, source}, ...]
+        # 预取辅助信息
+        traces_used = (ex.get("traces_used_in_prompt") or "").strip()
+        traces_nat = ex.get("traces_natural") if isinstance(ex.get("traces_natural"), list) else []
+        # 统计总自然轨迹 tokens（拼接后再计数，供分析）
+        traces_nat_joined = "\n----- TRACE -----\n".join([strip_think(t) for t in traces_nat]) if traces_nat else ""
+        # 标记：summary 是否为增广（存在 traces_used_in_prompt 即视为 True）
+        summary_augmented = bool(traces_used)
+
         for gi, r in enumerate(reasonings):
             rows.append({
                 "uuid": ex.get("uuid"),
@@ -460,12 +512,16 @@ def main():
                 "solution_human": ex.get("solution") or "",
                 "answer_gold": (ex.get("answer") or ex.get("answer_gold") or ex.get("gold_answer") or ""),
                 "source": ex.get("source"),
+                "reasoning_source": r["source"],               # 新增：本条使用的来源
                 "generations_len": len(reasonings),
                 "gen_index": gi,
                 "finish_reasons": (ex.get("finish_reasons") or [None]*len(reasonings)),
-                "reasoning_raw": r
+                "reasoning_raw": r["text"],                    # 用于分句/宏步骤
+                "traces_used_in_prompt": traces_used,          # 仅记录
+                "traces_natural_joined": traces_nat_joined,    # 仅记录（分析统计）
+                "summary_augmented": summary_augmented         # 新增标记
             })
-    print(f"Expanded to {len(rows)} problem-traces")
+    print(f"Expanded to {len(rows)} problem-reasonings")
 
     # 三文件 writers
     fp_raw = open(os.path.join(args.outdir, "raw_masked.jsonl"), "w", encoding="utf-8")
@@ -488,11 +544,16 @@ def main():
         n_ans_model = count_tokens(tok_inst, model_ans or "")
         n_sol_human = count_tokens(tok_inst, ex["solution_human"] or "")
 
+        # 新增：轨迹 token 统计（不参与分句）
+        n_traces_used = count_tokens(tok_inst, ex.get("traces_used_in_prompt") or "")
+        n_traces_nat_joined = count_tokens(tok_inst, ex.get("traces_natural_joined") or "")
+
         # 分句
         sents = split_sentences(masked, tok_inst)
 
         # 宏步骤
         macros = macro_chunk(sents, tok_inst)
+        # 如需压缩数量，可打开下一行（结合 target_min/target_max）
         # macros = compress_macros(macros, tok_inst, target_min=args.target_min, target_max=args.target_max)
 
         # features：补全支持提示
@@ -514,6 +575,8 @@ def main():
         rec_raw = {
             "uuid": ex["uuid"],
             "gen_index": ex["gen_index"],
+            "reasoning_source": ex.get("reasoning_source"),
+            "summary_augmented": bool(ex.get("summary_augmented")),
             "problem": ex["problem"],
             "answer_gold": ex["answer_gold"],
             "solution_human": ex["solution_human"],
@@ -527,6 +590,10 @@ def main():
             "tokens_reasoning_masked": n_r_mask,
             "tokens_model_answer": n_ans_model,
             "tokens_solution_human": n_sol_human,
+            # 新增：轨迹 token 统计
+            "traces_used_in_prompt": ex.get("traces_used_in_prompt"),
+            "tokens_traces_used_in_prompt": n_traces_used,
+            "tokens_traces_natural_joined": n_traces_nat_joined,
             "tokenizer": args.tokenizer,
             "finish_reason": (
                 ex["finish_reasons"][ex["gen_index"]]
@@ -540,6 +607,8 @@ def main():
         rec_sent = {
             "uuid": ex["uuid"],
             "gen_index": ex["gen_index"],
+            "reasoning_source": ex.get("reasoning_source"),
+            "summary_augmented": bool(ex.get("summary_augmented")),
             "n_sentences": len(sents),
             "sentences": [asdict(s) for s in sents]
         }
@@ -549,6 +618,8 @@ def main():
         rec_mac = {
             "uuid": ex["uuid"],
             "gen_index": ex["gen_index"],
+            "reasoning_source": ex.get("reasoning_source"),
+            "summary_augmented": bool(ex.get("summary_augmented")),
             "n_macros": len(macros),
             "macro_steps": [asdict(m) for m in macros],
             "candidate_macro_ids": candidate_macro_ids

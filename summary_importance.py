@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Iterable, Optional
 import numpy as np
 import math
@@ -43,6 +43,7 @@ class Sample:
     gold_answer: str
     steps: List[str]         # steps according to chosen granularity
     full_trace: str          # concatenation of steps
+    meta: Dict[str, any] = field(default_factory=dict)  # reasoning_source, summary_augmented, etc.
 
 @dataclass
 class GenTask:
@@ -181,6 +182,12 @@ def align_from_preprocessed(
     sentences_path: str,
     granularity: str = "macro",
 ) -> List[Sample]:
+    """
+    兼容新的预处理输出：
+      - raw_masked.jsonl 中包含 reasoning_source / summary_augmented /
+        tokens_traces_used_in_prompt / tokens_traces_natural_joined
+      - macro_steps.jsonl / sentences.jsonl 中包含 reasoning_source / summary_augmented
+    """
     raw = read_jsonl(raw_masked_path)
     raw_by_key: Dict[Key, dict] = {}
     for r in raw:
@@ -203,6 +210,14 @@ def align_from_preprocessed(
         r = raw_by_key[key]
         steps = get_steps(s)
         full_trace = "\n".join(steps)
+
+        meta = {
+            "reasoning_source": s.get("reasoning_source") or r.get("reasoning_source"),
+            "summary_augmented": bool(s.get("summary_augmented") or r.get("summary_augmented")),
+            "tokens_traces_used_in_prompt": r.get("tokens_traces_used_in_prompt"),
+            "tokens_traces_natural_joined": r.get("tokens_traces_natural_joined"),
+        }
+
         samples.append(
             Sample(
                 key=key,
@@ -210,6 +225,7 @@ def align_from_preprocessed(
                 gold_answer=r.get("answer_gold","") or r.get("answer",""),
                 steps=steps,
                 full_trace=full_trace,
+                meta=meta
             )
         )
     return samples
@@ -217,25 +233,29 @@ def align_from_preprocessed(
 def align_from_summary_jsonl(
     summary_jsonl: str,
     granularity: str = "sentence",
-    source_priority: Tuple[str,...] = ("summary_answer_driven","traces_natural"),
+    # 默认优先使用 trace-aug 版本，其次纯 Q+A，再回退 traces 列表
+    source_priority: Tuple[str,...] = ("summary_trace_augmented","summary_answer_driven","traces_natural"),
 ) -> List[Sample]:
-    """直接从 /mnt/data/out_openr1_answer_summaries.jsonl 构造样本。"""
+    """
+    直接从 summaries 文件构造样本；同时推断 meta：
+      - reasoning_source: 哪个字段被选中
+      - summary_augmented: 若选中 summary_trace_augmented 或存在 traces_used_in_prompt 则 True
+    """
     data = read_jsonl(summary_jsonl)
     samples: List[Sample] = []
     for i, ex in enumerate(data):
         uuid = ex.get("uuid") or ex.get("id") or f"rec_{i:06d}"
         problem = ex.get("question","")
         gold_answer = ex.get("final_answer","") or ex.get("answer","") or ""
-        text_src = None
 
+        text_src, src_name = None, None
         for key in source_priority:
             val = ex.get(key)
             if isinstance(val, str) and val.strip():
-                text_src = val.strip()
-                break
+                text_src = val.strip(); src_name = key; break
             if isinstance(val, list) and val:
                 text_src = "\n".join([str(v) for v in val if str(v).strip()])
-                break
+                src_name = key; break
 
         if not text_src:
             # 没有 summary 也没有 traces，就跳过
@@ -244,18 +264,29 @@ def align_from_summary_jsonl(
         if granularity == "sentence":
             steps = split_sentences_from_text(text_src)
         elif granularity == "macro":
-            # 简约做法：仍按句子切，但后续你可以替换为更强的 chunker
+            # 简约做法：仍按句子切，但后续可替换为宏步聚类器
             steps = split_sentences_from_text(text_src)
         else:
             raise ValueError(f"Unknown granularity: {granularity}")
 
         full_trace = "\n".join(steps)
+
+        # 推断是否 trace-aug
+        summary_augmented = bool(ex.get("traces_used_in_prompt")) or (src_name == "summary_trace_augmented")
+
+        meta = {
+            "reasoning_source": src_name,
+            "summary_augmented": summary_augmented,
+            # 若你想统计 traces_used 的长度/字符数，可在下游再统计
+        }
+
         samples.append(Sample(
             key=Key(uuid=uuid, gen_index=0),  # summary 默认只有一条轨迹
             problem=problem,
             gold_answer=gold_answer,
             steps=steps,
             full_trace=full_trace,
+            meta=meta
         ))
     return samples
 
@@ -420,10 +451,11 @@ def run_ablation(
     # ---------- build generation tasks (with truncation) ----------
     tasks: List[GenTask] = []
     gold_by_key = {}
+    sample_meta: Dict[Key, Dict[str, any]] = {}
 
     for s in samples:
-        # golds for acc_drop
         gold_by_key[s.key] = s.gold_answer
+        sample_meta[s.key] = s.meta or {}
 
         base_prompt = build_chat_prompt(tokenizer, s.problem, s.full_trace)
         base_len = prompt_len(base_prompt)
@@ -479,6 +511,9 @@ def run_ablation(
                 "max_model_len": max_model_len,
                 "max_new_tokens": max_new_tokens,
                 "truncated_variants": truncated_variants,
+                # 附带 meta 便于排查 trace-aug 是否更易触发截断
+                "reasoning_source": sample_meta[s.key].get("reasoning_source"),
+                "summary_augmented": bool(sample_meta[s.key].get("summary_augmented")),
             })
 
     if trunc_logs:
@@ -534,6 +569,8 @@ def run_ablation(
 
             is_match = int(pred_norm == gold_norm) if gold_norm else None
 
+            meta = sample_meta.get(t.sample_key, {}) if sample_meta else {}
+
             record = {
                 "uuid": t.sample_key.uuid,
                 "gen_index": t.sample_key.gen_index,
@@ -553,7 +590,13 @@ def run_ablation(
                 "offline": int(offline),
                 "ctx_headroom": ctx_headroom,
                 "avg_logp": avg_logp,
-                "gen_n_tokens": n_tok
+                "gen_n_tokens": n_tok,
+                # 新增：把来源与是否trace-aug带入结果，便于分组分析
+                "reasoning_source": meta.get("reasoning_source"),
+                "summary_augmented": bool(meta.get("summary_augmented")),
+                # 若从预处理路径来，还可带 token 统计
+                "tokens_traces_used_in_prompt": meta.get("tokens_traces_used_in_prompt"),
+                "tokens_traces_natural_joined": meta.get("tokens_traces_natural_joined"),
             }
             results.append(record)
 
@@ -647,16 +690,15 @@ def main():
     parser.add_argument("--offline", action="store_true", default=True)
 
     # data (two modes; summary first)
-    parser.add_argument("--summary-jsonl", type=str, default="/root/autodl-fs/out_openr1_answer_summaries.jsonl",
+    parser.add_argument("--summary-jsonl", type=str, default="/root/autodl-fs/out2000/A+Q+RT/math/out_openr1_answer_summaries.jsonl",
                         help="If provided, the script reads from this file and segments steps on the fly.")
-    # parser.add_argument("--raw-masked", type=str, default="/root/autodl-tmp/out200/summary/raw_masked.jsonl")
-    parser.add_argument("--raw-masked", type=str, default = "/root/autodl-tmp/out2000/new_prompt/summary/raw_masked.jsonl")
-    parser.add_argument("--macro-steps", type=str, default="/root/autodl-tmp/out2000/new_prompt/summary/macro_steps.jsonl")
-    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out200/new_prompt/summary/sentences.jsonl")
+    parser.add_argument("--raw-masked", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/math/raw_masked.jsonl")
+    parser.add_argument("--macro-steps", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/math/macro_steps.jsonl")
+    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/math/sentences.jsonl")
 
     # behavior
     parser.add_argument("--granularity", type=str, choices=["macro", "sentence"], default="sentence")
-    parser.add_argument("--out", type=str, default="/root/autodl-fs/out2000/new_prompt/summary/math/ablation_from_summary.jsonl")
+    parser.add_argument("--out", type=str, default="/root/autodl-fs/out2000/A+Q+RT/math/ablation_from_summary.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--bsz", type=int, default=32)
     parser.add_argument("--limit", type=int, default=2000)

@@ -23,7 +23,9 @@ def read_jsonl(path: str) -> List[dict]:
     return items
 
 def write_jsonl(path: str, records: Iterable[dict]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirn = os.path.dirname(path)              # ★ 更稳妥：只有在有目录名时才建目录
+    if dirn:
+        os.makedirs(dirn, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
@@ -45,20 +47,27 @@ class Sample:
     full_trace: str          # concatenation of steps
 
 # --------------------
-# Answer extraction & normalization
+# Answer extraction & normalization (for model outputs)
 # --------------------
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
 ANS_TAG_RE = re.compile(r"(?:Final Answer|Answer)\s*[:：]\s*(.+)", re.IGNORECASE)
+ANS_XML_RE = re.compile(r"<ans>(.*?)</ans>", re.DOTALL | re.IGNORECASE)
 
 def extract_final_answer(text: str) -> str:
     if not text:
         return ""
+    # 优先我们要求的 <ans>…</ans>
+    m = ANS_XML_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    # 其次常见格式
     m = BOXED_RE.search(text)
     if m:
         return m.group(1).strip()
     m = ANS_TAG_RE.search(text)
     if m:
         return m.group(1).strip().splitlines()[0].strip()
+    # 兜底：最后一行
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     if lines:
         return lines[-1]
@@ -126,7 +135,7 @@ def align_samples(
     # Index raw by key
     raw_by_key: Dict[Key, dict] = {}
     for r in raw:
-        # raw.jsonl (general) or raw_masked.jsonl (openr1/glaive) 都有 uuid/gen_index
+        # raw.jsonl（trace_prep 产物）有 uuid/gen_index
         raw_by_key[Key(uuid=str(r["uuid"]), gen_index=int(r["gen_index"]))] = r
 
     seg = read_jsonl(sentences_path)
@@ -136,17 +145,24 @@ def align_samples(
         if key not in raw_by_key:
             continue
         r = raw_by_key[key]
-        # 支持两种原始字段：summary_raw / reasoning_masked / reasoning_raw
+
+        # problem 字段
         problem = r.get("problem") or r.get("question") or r.get("prompt") or ""
+
+        # steps（句子切分文本）
         steps = [str(si["text"]) for si in s.get("sentences", []) if str(si.get("text","")).strip()]
         if not steps:
             continue
+
+        # gold answer：trace_prep 的 raw.jsonl 用的是 final_answer（不一定都有）
+        gold_answer = r.get("final_answer") or r.get("answer_gold") or ""
+
         full_trace = "\n".join(steps)
         samples.append(
             Sample(
                 key=key,
                 problem=problem,
-                gold_answer=r.get("answer_gold",""),
+                gold_answer=gold_answer,
                 steps=steps,
                 full_trace=full_trace,
             )
@@ -229,11 +245,13 @@ def run_ablation(
         download_dir=download_dir,
     )
 
+    # 默认将 </ans> 作为停止符，稳定解析
+    stop_list = list(stop or []) + ["</ans>"]
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         max_tokens=max_new_tokens,
-        stop=stop or [],
+        stop=stop_list,
         logprobs=1,
     )
 
@@ -379,7 +397,7 @@ def run_ablation(
         write_jsonl(imp_path, impossible_logs)
         print(f"[truncate] Wrote {len(impossible_logs)} impossible-sample records -> {imp_path}", file=sys.stderr)
 
-    print(f"Total generation tasks (after truncation): {len(tasks)}", file=sys.stderr)
+    print(f"Total generation tasks: {len(tasks)}", file=sys.stderr)
 
     # -------- Run generation in batches --------
     results = []
@@ -390,7 +408,7 @@ def run_ablation(
             cand = out.outputs[0] if out.outputs else None
             text = cand.text if cand else ""
 
-            # Robust chosen-token logprob extraction + avg log-p
+            # avg log-prob of generated tokens
             token_lps = getattr(cand, "token_logprobs", None) if cand else None
             if token_lps is None and cand is not None:
                 lp_list = getattr(cand, "logprobs", None)
@@ -417,6 +435,7 @@ def run_ablation(
 
             pred_raw = extract_final_answer(text)
             pred_norm = normalize_answer(pred_raw)
+            gold_norm = normalize_answer(next((s.gold_answer for s in samples if s.key == t.sample_key), ""))
 
             record = {
                 "uuid": t.sample_key.uuid,
@@ -426,6 +445,8 @@ def run_ablation(
                 "pred_text": text,
                 "pred_extracted": pred_raw,
                 "pred_norm": pred_norm,
+                "gold_norm": gold_norm,
+                "is_correct_norm": int(bool(pred_norm and gold_norm and pred_norm == gold_norm)),
                 "granularity": "sentence",
                 "model": str(model_name),
                 "max_new_tokens": max_new_tokens,
@@ -499,11 +520,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct",
                         help="本地模型目录（离线模式下必须是本地）")
-    parser.add_argument("--raw", type=str, default="/root/autodl-tmp/out2000/general/raw_masked.jsonl",
-                        help="原始记录（general 用 raw.jsonl；openr1/glaive 用 raw_masked.jsonl）")
-    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out2000/general/sentences.jsonl",
-                        help="句子级分割文件（含 sentences[*].text）")
-    parser.add_argument("--out", type=str, default="/root/autodl-tmp/out2000/general/reasoning/ablation_sentence_importance.jsonl")
+
+    # ★ 改为对接 trace 预处理产物
+    parser.add_argument("--raw", type=str,
+                        default="/root/autodl-tmp/out2000/A+Q+RT/general/trace_prep/raw.jsonl",
+                        help="trace 预处理产物 raw.jsonl（含 uuid/gen_index/problem/final_answer 等）")
+    parser.add_argument("--sentences", type=str,
+                        default="/root/autodl-tmp/out2000/A+Q+RT/general/trace_prep/sentences.jsonl",
+                        help="trace 预处理产物 sentences.jsonl（含 sentences[*].text）")
+
+    parser.add_argument("--out", type=str,
+                        default="/root/autodl-tmp/out2000/A+Q+RT/general/reasoning/ablation_sentence_importance.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--bsz", type=int, default=32)
     parser.add_argument("--limit", type=int, default=200)
@@ -516,7 +543,7 @@ def main():
     parser.add_argument("--ctx-headroom", type=int, default=64, help="模板预留 token 余量")
     parser.add_argument("--normalize", type=str, default="minmax", choices=["minmax", "softmax", "zscore", "none"])
     parser.add_argument("--tp", type=int, default=1, help="vLLM tensor_parallel_size")
-    parser.add_argument("--stop", type=str, nargs="*", default=None, help="可选停止词列表")
+    parser.add_argument("--stop", type=str, nargs="*", default=None, help="可选停止词列表（将自动追加 </ans>）")
     args = parser.parse_args()
 
     run_ablation(
