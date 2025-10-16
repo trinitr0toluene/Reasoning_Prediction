@@ -9,13 +9,15 @@ from transformers import AutoTokenizer
 # ===================== CLI =====================
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input_jsonl", type=str, default = "/root/autodl-fs/out_glaive_answer_summaries.jsonl",
+    ap.add_argument("--input_jsonl", type=str, default="/root/autodl-fs/out2000/A+Q+RT/general/out_glaive_answer_summaries.jsonl",
                     help="general 数据集的本地 JSONL，包含 summary 字段（或同义字段）")
-    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/general/summary/out_general_prep",
+    ap.add_argument("--outdir", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/general/summary/out_general_prep",
                     help="输出目录，包含 raw.jsonl / sentences.jsonl")
     ap.add_argument("--tokenizer", type=str, default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct",
                     help="用于统计 token 数（可填本地 tokenizer 目录）")
-    ap.add_argument("--limit", type=int, default=2000, help="仅处理前 N 条（调试）")
+    ap.add_argument("--limit", type=int, default=None, help="仅处理前 N 条（调试）")
+    ap.add_argument("--no_token_counts", action="store_true",  # ★ 可选：在预处理里也关闭 token 统计
+                    help="不在预处理阶段统计 token 数，所有 tokens_* 字段与句子 tokens 置 0")
     return ap.parse_args()
 
 # ===================== 正则&工具 =====================
@@ -51,6 +53,8 @@ def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
                 continue
 
 def count_tokens(tok, s: str) -> int:
+    if tok is None:  # ★ 支持不统计
+        return 0
     return len(tok(s, add_special_tokens=False).input_ids)
 
 def hold_latex_blocks(s: str) -> Tuple[str, List[str]]:
@@ -75,7 +79,6 @@ def split_sentences(text_in: str, tok) -> List[Sentence]:
         line = line.strip()
         if not line:
             continue
-        # 去掉开头编号/项目符号
         if RE_BULLET.match(line):
             line = RE_BULLET.sub("", line)
 
@@ -90,10 +93,8 @@ def split_sentences(text_in: str, tok) -> List[Sentence]:
         if tail:
             rough.append(tail)
 
-    # 还原 LaTeX
     rough = [restore_latex(s, blocks) for s in rough]
 
-    # 合并极短/口头语到后句
     merged: List[str] = []
     i = 0
     while i < len(rough):
@@ -108,13 +109,12 @@ def split_sentences(text_in: str, tok) -> List[Sentence]:
             merged.append(seg)
             i += 1
 
-    # 生成带位置信息的句子结构
     sentences: List[Sentence] = []
     cursor = 0
     for idx, seg in enumerate(merged, start=1):
         pos = text.find(seg, cursor)
         if pos < 0:
-            pos = cursor  # 容错：找不到时按顺序推进
+            pos = cursor
         start, end = pos, pos + len(seg)
         tok_n = count_tokens(tok, seg)
         sentences.append(Sentence(idx, seg, start, end, tok_n))
@@ -124,17 +124,12 @@ def split_sentences(text_in: str, tok) -> List[Sentence]:
 # ===================== Summary 抽取 =====================
 def extract_summaries(ex: Dict[str, Any]) -> List[str]:
     """
-    尽量通用地从记录里取“summary”：
-    优先顺序：
-      1) answer_summaries
-      2) summary
-      3) summaries
-      4) summary_text / summary_en / summary_zh
-    统一返回 list[str]
+    从记录里取“summary”。为兼容 A+Q+RT，优先使用我们生成的 summary 字段。
     """
     fields_priority = [
+        "summary_answer_driven",  # ★ 提前为第一优先
         "answer_summaries", "summary", "summaries",
-        "summary_text", "summary_en", "summary_zh","summary_answer_driven"
+        "summary_text", "summary_en", "summary_zh",
     ]
     vals: List[str] = []
     for k in fields_priority:
@@ -148,7 +143,7 @@ def extract_summaries(ex: Dict[str, Any]) -> List[str]:
             if s:
                 vals.append(s)
         if vals:
-            break  # 命中一个字段就用它
+            break
     return vals
 
 # ===================== 主流程 =====================
@@ -156,15 +151,17 @@ def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    # tokenizer
-    tokenizer_id = args.tokenizer
-    use_local = os.path.isdir(tokenizer_id)  # 传目录→本地
-    tok = AutoTokenizer.from_pretrained(
-        tokenizer_id,
-        use_fast=True,
-        trust_remote_code=True,
-        local_files_only=use_local
-    )
+    # tokenizer（可选）
+    tok = None
+    if not args.no_token_counts:  # ★ 允许关闭
+        tokenizer_id = args.tokenizer
+        use_local = os.path.isdir(tokenizer_id)
+        tok = AutoTokenizer.from_pretrained(
+            tokenizer_id,
+            use_fast=True,
+            trust_remote_code=True,
+            local_files_only=use_local
+        )
 
     # 输出文件
     fp_raw = open(os.path.join(args.outdir, "raw.jsonl"), "w", encoding="utf-8")
@@ -179,31 +176,38 @@ def main():
 
             # 支持一条样本多个 summary
             for gi, summ in enumerate(summaries):
-                # 句子切分（不做 mask）
+                # 句子切分
                 sents = split_sentences(summ, tok)
 
-                # 统计
-                n_prompt = len(tok((ex.get("problem") or ex.get("question") or ex.get("prompt") or ""), add_special_tokens=False).input_ids)
-                n_summ_tokens = len(tok(summ, add_special_tokens=False).input_ids)
+                # 统计（可关）
+                problem_text = ex.get("problem") or ex.get("question") or ex.get("prompt") or ""
+                n_prompt = count_tokens(tok, problem_text)
+                n_summ_tokens = count_tokens(tok, summ)
 
-                # 写 raw.jsonl
+                # 统一 id（兼容我们新导出的 sample_id / uuid）
+                uid = ex.get("uuid") or ex.get("id") or ex.get("sample_id") or f"general-{idx}"
+
+                # 写 raw.jsonl —— ★ 透传 A+Q+RT 关键信息
                 rec_raw = {
-                    "uuid": ex.get("uuid") or ex.get("id") or f"general-{idx}",
+                    "uuid": uid,
                     "gen_index": gi,
-                    "problem": ex.get("problem") or ex.get("question") or ex.get("prompt") or "",
+                    "problem": problem_text,
+                    "final_answer": ex.get("final_answer", ""),              # ★ 透传
                     "summary_raw": summ,
                     "tokens_prompt": n_prompt,
                     "tokens_summary": n_summ_tokens,
-                    "tokenizer": args.tokenizer,
-                    # 透传可能有用的字段，避免丢信息
+                    "tokenizer": args.tokenizer if tok is not None else None,
+                    "traces_natural": ex.get("traces_natural", []),          # ★ 透传
+                    "traces_used_in_prompt": ex.get("traces_used_in_prompt", ""),  # ★ 透传
+                    "response_raw": ex.get("response_raw", ""),              # ★ 透传
                     "source": ex.get("source"),
-                    "meta": {k: ex.get(k) for k in ("dataset", "task_type") if k in ex}
+                    "meta": ex.get("meta", {}),                              # ★ 透传
                 }
                 fp_raw.write(json.dumps(rec_raw, ensure_ascii=False) + "\n")
 
-                # 写 sentences.jsonl
+                # 写 sentences.jsonl（保持结构不变）
                 rec_sent = {
-                    "uuid": rec_raw["uuid"],
+                    "uuid": uid,
                     "gen_index": gi,
                     "n_sentences": len(sents),
                     "sentences": [asdict(s) for s in sents]

@@ -40,8 +40,9 @@ class Key:
 class Sample:
     key: Key
     problem: str
-    steps: List[str]         # sentence-level steps (来自 summary 的句子)
-    full_trace: str          # 全部句子拼接
+    final_answer: str            # 新增：用于可选地给二次摘要器看
+    steps: List[str]             # sentence-level steps (来自 summary 的句子)
+    full_trace: str              # 全部句子拼接
 
 # --------------------
 # Summary extraction & normalization
@@ -65,7 +66,7 @@ def normalize_summary(s: str) -> str:
     return WS_RE.sub(" ", s)
 
 # --------------------
-# Prompt builder (Summary)
+# Prompt builder (Summary) with optional Final Answer
 # --------------------
 SYSTEM_PROMPT = (
     "You are a precise summarizer. Read the problem and the provided hints. "
@@ -73,7 +74,25 @@ SYSTEM_PROMPT = (
     "Do NOT show equations or detailed steps. Output ONLY <summary>...</summary>."
 )
 
-USER_TEMPLATE = """Summarize using ONLY the hints below.
+def render_user_block(problem: str, final_answer: str, hints: str, include_answer: bool) -> str:
+    """include_answer=True 时在提示里加入 Final Answer；否则不显示答案。"""
+    if include_answer and (final_answer or "").strip():
+        return f"""Summarize using ONLY the hints below.
+
+[Problem]
+{problem}
+
+[Final Answer]
+{final_answer}
+
+[Hints]
+{hints}
+
+Return exactly one line:
+<summary>...your concise summary...</summary>
+"""
+    else:
+        return f"""Summarize using ONLY the hints below.
 
 [Problem]
 {problem}
@@ -85,18 +104,35 @@ Return exactly one line:
 <summary>...your concise summary...</summary>
 """
 
-def build_chat_prompt(tokenizer, problem: str, hints: str) -> str:
+def build_chat_prompt(tokenizer, problem: str, final_answer: str, hints: str, include_answer: bool) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_TEMPLATE.format(problem=problem, hints=hints)},
+        {"role": "user", "content": render_user_block(problem, final_answer, hints, include_answer)},
     ]
     # 优先走模型自带 chat_template；没有则用朴素回退
     try:
         return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     except Exception:
         sys_prompt = f"[SYSTEM]\n{SYSTEM_PROMPT}\n"
-        usr_prompt = USER_TEMPLATE.format(problem=problem, hints=hints)
+        usr_prompt = render_user_block(problem, final_answer, hints, include_answer)
         return sys_prompt + "\n" + usr_prompt + "\n\nAssistant:"
+
+# --------------------
+# Answer scrubbing
+# --------------------
+def scrub_answer(text: str, final_answer: str) -> str:
+    """从文本中清洗掉答案字面，避免泄露（基础、稳健的做法）。"""
+    if not final_answer:
+        return text
+    ans = str(final_answer).strip()
+    if not ans:
+        return text
+    out = re.sub(re.escape(ans), "<ANS>", text, flags=re.IGNORECASE)
+
+    # 如果是纯数值，进一步用“非数字边界”替换，覆盖如 '42' 在 '1420' 中的情况
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", ans):
+        out = re.sub(rf"(?<!\d){re.escape(ans)}(?!\d)", "<NUM>", out)
+    return out
 
 # --------------------
 # Data loading & alignment
@@ -118,11 +154,12 @@ def align_samples(
             continue
         r = raw_by_key[key]
         problem = r.get("problem") or r.get("question") or r.get("prompt") or ""
+        final_answer = r.get("final_answer") or ""   # 预处理已透传；缺失则置空
         steps = [str(si["text"]) for si in s.get("sentences", []) if str(si.get("text","")).strip()]
         if not steps:
             continue
         full_trace = "\n".join(steps)
-        samples.append(Sample(key=key, problem=problem, steps=steps, full_trace=full_trace))
+        samples.append(Sample(key=key, problem=problem, final_answer=final_answer, steps=steps, full_trace=full_trace))
     return samples
 
 # --------------------
@@ -162,6 +199,8 @@ def run_ablation(
     normalize: str = "minmax",
     tp: int = 1,
     stop: Optional[List[str]] = None,
+    mask_final_answer: bool = True,              # ★ 新增：默认屏蔽 Final Answer（预测型重要性）
+    scrub_answer_from_steps: bool = True,        # ★ 新增：默认清洗 hints 里的答案字面
 ):
     # --- Offline & threading env ---
     if offline:
@@ -212,11 +251,15 @@ def run_ablation(
     def prompt_len(text: str) -> int:
         return len(vtok.encode(text))
 
-    def fit_head_tail(problem: str, steps: List[str], drop_idx: int, budget: int, sep: str = "\n"):
+    include_ans = not mask_final_answer  # 控制是否在提示中包含 Final Answer
+
+    def fit_head_tail(problem: str, final_answer: str, steps: List[str], drop_idx: int, budget: int, sep: str = "\n"):
         """在不超预算下构造 head+tail hints；drop_idx=-1 表示 base。"""
         kept = steps if drop_idx == -1 else (steps[:drop_idx] + steps[drop_idx+1:])
+        if scrub_answer_from_steps:
+            kept = [scrub_answer(x, final_answer) for x in kept]
 
-        empty_prompt = build_chat_prompt(tokenizer, problem, "")
+        empty_prompt = build_chat_prompt(tokenizer, problem, final_answer, "", include_ans)
         if prompt_len(empty_prompt) > budget:
             return "", 0, 0, prompt_len(empty_prompt)
 
@@ -225,7 +268,7 @@ def run_ablation(
 
         def build_with(hh, tt) -> Tuple[str, int]:
             hints = sep.join(hh + (["<...>"] if (hh or tt) and (len(hh)+len(tt) < len(kept)) else []) + tt)
-            pr = build_chat_prompt(tokenizer, problem, hints)
+            pr = build_chat_prompt(tokenizer, problem, final_answer, hints, include_ans)
             return hints, prompt_len(pr)
 
         # 先尽量塞头
@@ -264,10 +307,13 @@ def run_ablation(
     for s in samples:
         # Base
         base_hints = s.full_trace
-        base_prompt = build_chat_prompt(tokenizer, s.problem, base_hints)
+        if scrub_answer_from_steps:
+            base_hints = scrub_answer(base_hints, s.final_answer)
+
+        base_prompt = build_chat_prompt(tokenizer, s.problem, s.final_answer, base_hints, include_ans)
         base_len = prompt_len(base_prompt)
 
-        empty_len = prompt_len(build_chat_prompt(tokenizer, s.problem, ""))
+        empty_len = prompt_len(build_chat_prompt(tokenizer, s.problem, s.final_answer, "", include_ans))
         if empty_len > CTX_BUDGET or empty_len > max_model_len:
             impossible_logs.append({
                 "uuid": s.key.uuid, "gen_index": s.key.gen_index,
@@ -279,9 +325,9 @@ def run_ablation(
 
         truncated_variants = []
         if base_len > CTX_BUDGET or base_len > max_model_len:
-            ht, hcnt, tcnt, toks_after = fit_head_tail(s.problem, s.steps, drop_idx=-1, budget=CTX_BUDGET)
+            ht, hcnt, tcnt, toks_after = fit_head_tail(s.problem, s.final_answer, s.steps, drop_idx=-1, budget=CTX_BUDGET)
             base_hints = ht
-            base_prompt = build_chat_prompt(tokenizer, s.problem, base_hints)
+            base_prompt = build_chat_prompt(tokenizer, s.problem, s.final_answer, base_hints, include_ans)
             truncated_variants.append({
                 "variant": "base",
                 "before_tokens": base_len, "after_tokens": toks_after,
@@ -292,12 +338,15 @@ def run_ablation(
         # Per-sentence ablations
         for k in range(len(s.steps)):
             hints_k = "\n".join(s.steps[:k] + s.steps[k+1:])
-            prompt_k = build_chat_prompt(tokenizer, s.problem, hints_k)
+            if scrub_answer_from_steps:
+                hints_k = scrub_answer(hints_k, s.final_answer)
+
+            prompt_k = build_chat_prompt(tokenizer, s.problem, s.final_answer, hints_k, include_ans)
             len_k = prompt_len(prompt_k)
             if len_k > CTX_BUDGET or len_k > max_model_len:
-                ht, hcnt, tcnt, toks_after = fit_head_tail(s.problem, s.steps, drop_idx=k, budget=CTX_BUDGET)
+                ht, hcnt, tcnt, toks_after = fit_head_tail(s.problem, s.final_answer, s.steps, drop_idx=k, budget=CTX_BUDGET)
                 hints_k = ht
-                prompt_k = build_chat_prompt(tokenizer, s.problem, hints_k)
+                prompt_k = build_chat_prompt(tokenizer, s.problem, s.final_answer, hints_k, include_ans)
                 truncated_variants.append({
                     "variant": f"drop_{k}",
                     "before_tokens": len_k, "after_tokens": toks_after,
@@ -382,7 +431,10 @@ def run_ablation(
                 "offline": int(offline),
                 "ctx_headroom": ctx_headroom,
                 "avg_logp": avg_logp,
-                "gen_n_tokens": n_tok
+                "gen_n_tokens": n_tok,
+                # 记录本次设置，便于复现
+                "mask_final_answer": int(mask_final_answer),
+                "scrub_answer_from_steps": int(scrub_answer_from_steps),
             }
             results.append(record)
 
@@ -447,12 +499,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="/root/autodl-tmp/models/Qwen2.5-3B-Instruct",
                         help="本地模型目录（离线模式下必须是本地）")
-    # 默认指向 general/summary 预处理产物
-    parser.add_argument("--raw", type=str, default="/root/autodl-tmp/out2000/general/summary/out_general_prep/raw.jsonl",
+    # 默认指向 A+Q+RT general/summary 预处理产物
+    parser.add_argument("--raw", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/general/summary/out_general_prep/raw.jsonl",
                         help="summary 预处理产物 raw.jsonl")
-    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out2000/general/summary/out_general_prep/sentences.jsonl",
+    parser.add_argument("--sentences", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/general/summary/out_general_prep/sentences.jsonl",
                         help="summary 预处理产物 sentences.jsonl")
-    parser.add_argument("--out", type=str, default="/root/autodl-tmp/out2000/general/summary/ablation_sentence_summary.jsonl")
+    parser.add_argument("--out", type=str, default="/root/autodl-tmp/out2000/A+Q+RT/general/summary/ablation_sentence_summary.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--bsz", type=int, default=32)
     parser.add_argument("--limit", type=int, default=None)
@@ -466,6 +518,17 @@ def main():
     parser.add_argument("--normalize", type=str, default="minmax", choices=["minmax", "softmax", "zscore", "none"])
     parser.add_argument("--tp", type=int, default=1, help="vLLM tensor_parallel_size")
     parser.add_argument("--stop", type=str, nargs="*", default=None, help="可选停止词列表（会自动追加 </summary>）")
+
+    # 新增实验协议开关
+    parser.add_argument("--mask-final-answer", dest="mask_final_answer", action="store_true", default=True,
+                        help="二次摘要时不提供 Final Answer（默认开启：预测型重要性）")
+    parser.add_argument("--no-mask-final-answer", dest="mask_final_answer", action="store_false",
+                        help="二次摘要时提供 Final Answer（解释型重要性）")
+    parser.add_argument("--scrub-answer-from-steps", dest="scrub_answer_from_steps", action="store_true", default=True,
+                        help="从 hints/steps 文本里清洗掉答案字面（默认开启）")
+    parser.add_argument("--no-scrub-answer-from-steps", dest="scrub_answer_from_steps", action="store_false",
+                        help="不清洗 hints/steps 里的答案字面")
+
     args = parser.parse_args()
 
     run_ablation(
@@ -485,6 +548,8 @@ def main():
         normalize=args.normalize,
         tp=args.tp,
         stop=args.stop,
+        mask_final_answer=args.mask_final_answer,
+        scrub_answer_from_steps=args.scrub_answer_from_steps,
     )
 
 if __name__ == "__main__":
